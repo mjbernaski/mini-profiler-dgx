@@ -1,0 +1,10 @@
+# Ignore everything by default
+*
+
+# Track specific scripts and configs
+!.gitignore
+!compare_machines.sh
+!.config/
+!.config/systemd/
+!.config/systemd/user/
+!.config/systemd/user/compare-machines.service

@@ -1,0 +1,14 @@
+[Unit]
+Description=Compare DGX Spark machine configurations
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 30
+ExecStart=/home/mjbernaski/compare_machines.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
