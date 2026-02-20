@@ -8,6 +8,7 @@
 !.config/systemd/
 !.config/systemd/user/
 !.config/systemd/user/compare-machines.service
+!.config/systemd/user/mini-profiler.service
 !projects/
 !projects/mini-profiler/
 !projects/mini-profiler/mini_profiler.py

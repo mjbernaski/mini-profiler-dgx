@@ -1,0 +1,15 @@
+[Unit]
+Description=Mini Profiler - Compact System Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/mjbernaski/projects/mini-profiler/mini_profiler.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
