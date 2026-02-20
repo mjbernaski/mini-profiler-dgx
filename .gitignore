@@ -13,3 +13,4 @@
 !projects/mini-profiler/
 !projects/mini-profiler/mini_profiler.py
 !projects/mini-profiler/start_profiler.sh
+!projects/mini-profiler/mini_profiler_cli.py
