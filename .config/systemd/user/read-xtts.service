@@ -1,0 +1,18 @@
+[Unit]
+Description=Read aloud — local XTTS-v2 + Gemini TTS web service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mjbernaski/projects/debate-out-loud
+# Pin a stable port so the URL doesn't change on restart
+Environment=READ_XTTS_PORT=8770
+ExecStart=/home/mjbernaski/projects/debate-out-loud/.venv/bin/python3 read_xtts.py --network --preload --no-browser
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/tmp/read-xtts.log
+StandardError=append:/tmp/read-xtts.log
+
+[Install]
+WantedBy=default.target

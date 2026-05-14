@@ -9,8 +9,12 @@
 !.config/systemd/user/
 !.config/systemd/user/compare-machines.service
 !.config/systemd/user/mini-profiler.service
+!.config/systemd/user/ask-marin.service
+!.config/systemd/user/read-xtts.service
 !projects/
 !projects/mini-profiler/
 !projects/mini-profiler/mini_profiler.py
 !projects/mini-profiler/start_profiler.sh
 !projects/mini-profiler/mini_profiler_cli.py
+!projects/debate-out-loud/
+!projects/debate-out-loud/read_xtts.py

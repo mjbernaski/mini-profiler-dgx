@@ -1,0 +1,18 @@
+[Unit]
+Description=Ask Marin — voice Q&A web service (OpenAI Realtime)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mjbernaski/projects/debate-out-loud
+# Pin a stable port so the URL doesn't change on restart
+Environment=ASK_MARIN_PORT=8771
+ExecStart=/usr/bin/python3 ask_marin.py --network --no-browser
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/tmp/ask-marin.log
+StandardError=append:/tmp/ask-marin.log
+
+[Install]
+WantedBy=default.target
