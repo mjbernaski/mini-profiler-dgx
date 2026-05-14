@@ -2,10 +2,28 @@
 
 # Machine comparison script
 LOCAL_HOST=$(hostname)
-REMOTE_HOST="192.168.5.40"
-OUTPUT_DIR="/home/mjbernaski/machine_compare"
-mkdir -p "$OUTPUT_DIR"
-OUTPUT_FILE="$OUTPUT_DIR/machine_comparison_$(date +%Y%m%d_%H%M%S).compare"
+
+# Known machines in the pair — script picks whichever is NOT local as the remote
+MACHINE_A="192.168.5.40"
+MACHINE_B="192.168.5.46"
+
+# Determine which IPs belong to this host
+LOCAL_IPS=$(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+
+if echo "$LOCAL_IPS" | grep -qx "$MACHINE_A"; then
+    REMOTE_HOST="$MACHINE_B"
+elif echo "$LOCAL_IPS" | grep -qx "$MACHINE_B"; then
+    REMOTE_HOST="$MACHINE_A"
+else
+    echo "ERROR: This host ($LOCAL_HOST) is neither $MACHINE_A nor $MACHINE_B." >&2
+    echo "Local IPs: $(echo $LOCAL_IPS | tr '\n' ' ')" >&2
+    exit 1
+fi
+
+echo ">>> Local:  $LOCAL_HOST ($(echo "$LOCAL_IPS" | grep -E "^192\.168\.5\." | head -1))"
+echo ">>> Remote: $REMOTE_HOST"
+
+OUTPUT_FILE="/home/mjbernaski/machine_comparison_$(date +%Y%m%d_%H%M%S).compare"
 
 collect_info() {
     echo "=== HOSTNAME ==="
@@ -52,6 +70,19 @@ collect_info() {
     echo -e "\n=== DOCKER ==="
     docker --version 2>/dev/null || echo "Docker not installed"
     docker ps 2>/dev/null | tail -n +2 | wc -l && echo "containers running" || true
+
+    echo -e "\n=== UEFI ==="
+    if [ -d /sys/firmware/efi ]; then
+        echo "Boot mode: UEFI"
+        if command -v efibootmgr &>/dev/null; then
+            echo "Boot entries:"
+            efibootmgr 2>/dev/null || echo "  (efibootmgr requires root)"
+        else
+            echo "efibootmgr not installed"
+        fi
+    else
+        echo "Boot mode: Legacy BIOS (not UEFI)"
+    fi
 }
 
 {
@@ -68,8 +99,8 @@ collect_info() {
 
 # Generate package lists for comparison
 echo -e "\n>>> Generating package lists for comparison..."
-LOCAL_PKGS="/tmp/packages_local_$(hostname).txt"
-REMOTE_PKGS="/tmp/packages_remote.txt"
+LOCAL_PKGS="/tmp/packages_local_${LOCAL_HOST}_$$.txt"
+REMOTE_PKGS="/tmp/packages_remote_${REMOTE_HOST}_$$.txt"
 
 dpkg --get-selections | awk '{print $1}' | sort > "$LOCAL_PKGS"
 ssh $REMOTE_HOST "dpkg --get-selections" | awk '{print $1}' | sort > "$REMOTE_PKGS"
@@ -115,26 +146,3 @@ ssh $REMOTE_HOST "dpkg --get-selections" | awk '{print $1}' | sort > "$REMOTE_PK
 rm -f "$LOCAL_PKGS" "$REMOTE_PKGS"
 
 echo -e "\n>>> Comparison saved to: $OUTPUT_FILE"
-
-# Generate AI summary using ollama
-SUMMARY_FILE="$OUTPUT_DIR/machine_comparison_summary_$(date +%Y%m%d_%H%M%S).txt"
-echo -e "\n>>> Generating AI summary with ollama (gpt-oss:20b)..."
-
-PROMPT="Analyze this machine comparison report between two systems. Provide a clear summary that highlights:
-1. Overall health assessment of each machine (disk usage, memory, GPU status, services)
-2. Key hardware differences (CPU, memory, GPU, disk)
-3. Key software differences (OS, kernel, NVIDIA drivers, CUDA, Docker, package counts)
-4. Any concerns or recommendations (low disk space, missing drivers, version mismatches, etc.)
-Be concise and focus on what matters most.
-
-Here is the comparison data:
-
-$(cat "$OUTPUT_FILE")"
-
-ollama run gpt-oss:20b "$PROMPT" 2>/dev/null | tee "$SUMMARY_FILE"
-
-if [ ${PIPESTATUS[0]} -eq 0 ]; then
-    echo -e "\n>>> AI summary saved to: $SUMMARY_FILE"
-else
-    echo -e "\n>>> Warning: ollama summary generation failed. Is ollama running with gpt-oss:20b available?"
-fi
