@@ -345,6 +345,7 @@ HTML = r"""<!doctype html>
     <select id="voice"></select>
     <button id="read" class="primary">Read</button>
     <button id="stop">Stop</button>
+    <button id="save" disabled title="Save the last generated audio as a WAV file">Save</button>
     <button id="clear" title="Clear the text; voice stays as selected">Clear</button>
     <label class="status" style="display:flex; align-items:center; gap:6px;">
       Speed
@@ -372,6 +373,10 @@ const $meta   = document.getElementById('meta');
 // can cancel an in-flight stream and silence queued AudioBufferSourceNodes.
 let activeStream = null;
 
+// Last finished audio, ready to be downloaded as a single WAV file.
+// {blob, voice, engine} once a generation completes.
+let lastAudio = null;
+
 function setStatus(msg, cls='') {
   $status.className = 'status' + (cls ? ' ' + cls : '');
   $status.textContent = msg;
@@ -386,6 +391,38 @@ function makeOption(engine, name, label) {
   return o;
 }
 
+function loadScores(engine) {
+  try {
+    return JSON.parse(localStorage.getItem('voiceScores.' + engine) || '{}');
+  } catch (e) { return {}; }
+}
+
+// Sort an engine's voices: rated (high → low), then recommended (XTTS only),
+// then original list order. Returns augmented items with .score / .rec.
+function sortVoices(items, scores, recSet) {
+  const augmented = items.map((it, idx) => ({
+    ...it,
+    score: (scores[it.name] && typeof scores[it.name].score === 'number')
+              ? scores[it.name].score : null,
+    rec: recSet ? recSet.has(it.name) : false,
+    origIdx: idx,
+  }));
+  augmented.sort((a, b) => {
+    const sa = a.score == null ? -Infinity : a.score;
+    const sb = b.score == null ? -Infinity : b.score;
+    if (sb !== sa) return sb - sa;
+    if (a.rec !== b.rec) return a.rec ? -1 : 1;
+    return a.origIdx - b.origIdx;
+  });
+  return augmented;
+}
+
+function labelFor(item) {
+  if (item.score != null) return `${item.label} · ★${item.score}`;
+  if (item.rec)           return `${item.label} · ☆`;
+  return item.label;
+}
+
 async function loadVoices() {
   try {
     const r = await fetch('/voices');
@@ -397,36 +434,54 @@ async function loadVoices() {
       + `gemini: ${data.gemini.enabled ? data.gemini.model : 'disabled (' + (data.gemini.missing||'') + ')'}`;
     $voice.innerHTML = '';
 
+    const xttsScores = loadScores('xtts');
+    const geminiScores = loadScores('gemini');
+    let topXtts = null, topGemini = null;
+
     if (data.gemini.enabled) {
       const og = document.createElement('optgroup');
       og.label = 'Gemini Flash TTS (cloud)';
-      for (const v of data.gemini.voices) {
-        og.appendChild(makeOption('gemini', v.name, `${v.name} · ${v.style}`));
+      const items = data.gemini.voices.map(v => ({
+        name: v.name, label: `${v.name} · ${v.style}`,
+      }));
+      const sorted = sortVoices(items, geminiScores, null);
+      for (const it of sorted) {
+        og.appendChild(makeOption('gemini', it.name, labelFor(it)));
       }
       $voice.appendChild(og);
+      topGemini = sorted[0] || null;
     }
-    if (data.xtts.recommended && data.xtts.recommended.length) {
-      const og = document.createElement('optgroup');
-      og.label = 'XTTS-v2 local — Recommended';
-      for (const n of data.xtts.recommended) og.appendChild(makeOption('xtts', n, n));
-      $voice.appendChild(og);
-    }
+
     if (data.xtts.all && data.xtts.all.length) {
       const og = document.createElement('optgroup');
-      og.label = 'XTTS-v2 local — All speakers';
-      for (const n of data.xtts.all) og.appendChild(makeOption('xtts', n, n));
+      og.label = 'XTTS-v2 local';
+      const items = data.xtts.all.map(n => ({ name: n, label: n }));
+      const recSet = new Set(data.xtts.recommended || []);
+      const sorted = sortVoices(items, xttsScores, recSet);
+      for (const it of sorted) {
+        og.appendChild(makeOption('xtts', it.name, labelFor(it)));
+      }
       $voice.appendChild(og);
+      topXtts = sorted[0] || null;
     }
+
     if (data.xtts.error) setStatus('xtts: ' + data.xtts.error, 'err');
 
-    // Default to a local XTTS recommended voice (no API cost, no network).
-    // Fall back to Gemini only if XTTS failed to load.
-    if (data.xtts.recommended && data.xtts.recommended.length) {
-      $voice.value = 'xtts::' + data.xtts.recommended[0];
-    } else if (data.xtts.all && data.xtts.all.length) {
-      $voice.value = 'xtts::' + data.xtts.all[0];
-    } else if (data.gemini.enabled && data.gemini.voices.length) {
-      $voice.value = 'gemini::Aoede';
+    // Default selection: highest-rated voice across engines, tiebreaker XTTS
+    // (local, free). With no ratings yet, both scores tie at -Infinity and
+    // XTTS wins, so first-time users land on an XTTS voice as before.
+    const candidates = [];
+    if (topXtts)   candidates.push({ engine: 'xtts',   it: topXtts });
+    if (topGemini) candidates.push({ engine: 'gemini', it: topGemini });
+    candidates.sort((a, b) => {
+      const sa = a.it.score == null ? -Infinity : a.it.score;
+      const sb = b.it.score == null ? -Infinity : b.it.score;
+      if (sb !== sa) return sb - sa;
+      if (a.engine !== b.engine) return a.engine === 'xtts' ? -1 : 1;
+      return 0;
+    });
+    if (candidates.length) {
+      $voice.value = candidates[0].engine + '::' + candidates[0].it.name;
     }
   } catch (e) {
     setStatus('voice list failed: ' + e.message, 'err');
@@ -503,6 +558,9 @@ async function playXttsStream(url, t0) {
   let buf = new Uint8Array(0);
   let nextStartTime = 0;
   let firstAudioSignalled = false;
+  // Accumulate all PCM bytes so we can build a downloadable WAV at the end.
+  const pcmChunks = [];
+  let pcmTotalBytes = 0;
 
   while (true) {
     if (state.aborted) { try { reader.cancel(); } catch (e) {} break; }
@@ -521,6 +579,8 @@ async function playXttsStream(url, t0) {
     const pcm = buf.subarray(0, evenLen);
     buf = buf.subarray(evenLen);
     const ab = pcm.buffer.slice(pcm.byteOffset, pcm.byteOffset + evenLen);
+    pcmChunks.push(new Uint8Array(ab));
+    pcmTotalBytes += ab.byteLength;
     const samples = new Int16Array(ab);
     const floats = new Float32Array(samples.length);
     for (let i = 0; i < samples.length; i++) floats[i] = samples[i] / 32768;
@@ -542,9 +602,46 @@ async function playXttsStream(url, t0) {
     }
   }
   if (state.aborted) return;
+  if (header && pcmTotalBytes > 0) {
+    const wav = buildWavBlob(header.sampleRate, header.channels || 1,
+                             pcmChunks, pcmTotalBytes);
+    lastAudio = { blob: wav, engine: 'xtts' };
+    enableSaveButton(true);
+  }
   const totalDt = (performance.now() - t0) / 1000;
   const audioEnd = nextStartTime - ctx.currentTime;
   setStatus(`stream done at ${totalDt.toFixed(2)}s · ${audioEnd > 0 ? audioEnd.toFixed(1)+'s audio queued' : 'playing'}`, 'ok');
+}
+
+// Build a complete WAV blob from accumulated PCM chunks (mono int16).
+function buildWavBlob(sampleRate, channels, pcmChunks, totalBytes) {
+  const byteRate = sampleRate * channels * 2;
+  const blockAlign = channels * 2;
+  const header = new Uint8Array(44);
+  const dv = new DataView(header.buffer);
+  // "RIFF"
+  dv.setUint8(0, 0x52); dv.setUint8(1, 0x49); dv.setUint8(2, 0x46); dv.setUint8(3, 0x46);
+  dv.setUint32(4, 36 + totalBytes, true);
+  // "WAVE"
+  dv.setUint8(8, 0x57); dv.setUint8(9, 0x41); dv.setUint8(10, 0x56); dv.setUint8(11, 0x45);
+  // "fmt "
+  dv.setUint8(12, 0x66); dv.setUint8(13, 0x6D); dv.setUint8(14, 0x74); dv.setUint8(15, 0x20);
+  dv.setUint32(16, 16, true);
+  dv.setUint16(20, 1, true);           // PCM
+  dv.setUint16(22, channels, true);
+  dv.setUint32(24, sampleRate, true);
+  dv.setUint32(28, byteRate, true);
+  dv.setUint16(32, blockAlign, true);
+  dv.setUint16(34, 16, true);          // bits per sample
+  // "data"
+  dv.setUint8(36, 0x64); dv.setUint8(37, 0x61); dv.setUint8(38, 0x74); dv.setUint8(39, 0x61);
+  dv.setUint32(40, totalBytes, true);
+  return new Blob([header, ...pcmChunks], { type: 'audio/wav' });
+}
+
+function enableSaveButton(on) {
+  const btn = document.getElementById('save');
+  if (btn) btn.disabled = !on;
 }
 
 async function read() {
@@ -552,6 +649,8 @@ async function read() {
   if (!text) { setStatus('paste text first', 'err'); return; }
   stopActiveStream();
   $out.pause();
+  lastAudio = null;
+  enableSaveButton(false);
   $read.disabled = true;
   setStatus('synthesizing…');
   const t0 = performance.now();
@@ -579,6 +678,8 @@ async function read() {
       });
       if (!r.ok) throw new Error(await r.text());
       const blob = await r.blob();
+      lastAudio = { blob, engine: 'gemini' };
+      enableSaveButton(true);
       const url = URL.createObjectURL(blob);
       $out.src = url;
       $out.playbackRate = speed; // Gemini doesn't bake in rate
@@ -598,6 +699,20 @@ $stop.addEventListener('click', () => {
   stopActiveStream();
   $out.pause(); $out.currentTime = 0;
   setStatus('stopped');
+});
+
+document.getElementById('save').addEventListener('click', () => {
+  if (!lastAudio) return;
+  const ts = new Date().toISOString().replace(/[:T]/g,'-').replace(/\..*/,'');
+  const opt = $voice.selectedOptions[0];
+  const voiceTag = opt ? opt.dataset.voice.replace(/\s+/g,'_') : 'voice';
+  const name = `read_${voiceTag}_${ts}.wav`;
+  const url = URL.createObjectURL(lastAudio.blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  setStatus(`saved ${name} (${(lastAudio.blob.size/1024).toFixed(0)} KB)`, 'ok');
 });
 document.getElementById('clear').addEventListener('click', () => {
   $text.value = '';
@@ -620,6 +735,352 @@ $speed.addEventListener('input', updateSpeedDisplay);
 updateSpeedDisplay();
 
 loadVoices();
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Voice sampler — walk the RECOMMENDED list, each voice says its name and
+# a short sentence; user rates with 1–9 via keypress.
+# ---------------------------------------------------------------------------
+
+SAMPLER_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>XTTS voice sampler</title>
+<style>
+  :root {
+    --bg: #0e0e12; --panel: #16161d; --fg: #e6e6ee; --dim: #8a8aa0;
+    --accent: #7fff7f; --rule: #2a2a36; --bad: #ff7f7f;
+  }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif; }
+  body { max-width: 760px; margin: 0 auto; padding: 24px; }
+  h1 { margin: 0 0 4px; font-size: 22px; font-weight: 600; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 20px; }
+  .stage { background: var(--panel); border: 1px solid var(--rule);
+    border-radius: 14px; padding: 28px 24px; }
+  .progress { color: var(--dim); font-size: 13px; }
+  .voice-name { font-size: 32px; font-weight: 600; margin: 12px 0 4px; }
+  .voice-state { color: var(--dim); font-size: 13px; min-height: 18px; }
+  .keys { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 22px; }
+  .key { background: #0e0e12; border: 1px solid var(--rule); border-radius: 8px;
+    padding: 6px 10px; font: 13px ui-monospace, monospace; color: var(--dim); }
+  .key b { color: var(--fg); margin-right: 4px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 24px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--rule);
+    font-size: 14px; }
+  th { color: var(--dim); font-weight: 500; }
+  td.score { font-variant-numeric: tabular-nums; }
+  .bar { display: inline-block; height: 10px; background: var(--accent);
+    border-radius: 3px; vertical-align: middle; margin-left: 8px; }
+  .done { color: var(--accent); font-size: 16px; margin-top: 16px; }
+  button { background: var(--panel); color: var(--fg); border: 1px solid var(--rule);
+    border-radius: 8px; padding: 8px 14px; font: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); color: #0e1a0e; border: 0;
+    font-weight: 600; }
+  .err { color: var(--bad); font-size: 13px; }
+  .start-overlay { text-align: center; padding: 30px 0; }
+</style>
+</head>
+<body>
+  <h1 id="headline">XTTS voice sampler</h1>
+  <div class="sub" id="subline">Each voice says its name and a short sentence. Rate it 1–9; results land in the table below.</div>
+  <div class="sub" id="switchLink" style="margin-top:-12px;"></div>
+
+  <div class="stage" id="stage">
+    <div class="start-overlay" id="overlay">
+      <button class="primary" id="start">Start sampling</button>
+      <div class="sub" style="margin-top:10px;">A click is required so the browser will let audio play.</div>
+    </div>
+
+    <div id="active" style="display:none;">
+      <div class="progress" id="progress">Voice 0 of 0</div>
+      <div class="voice-name" id="voiceName">…</div>
+      <div class="voice-state" id="voiceState">loading…</div>
+      <div class="keys">
+        <span class="key"><b>1–9</b>rate</span>
+        <span class="key"><b>Space</b>replay</span>
+        <span class="key"><b>N</b>skip</span>
+        <span class="key"><b>Esc</b>stop</span>
+      </div>
+    </div>
+  </div>
+
+  <table id="resultsTable" style="display:none;">
+    <thead><tr><th>#</th><th>Voice</th><th>Score</th></tr></thead>
+    <tbody id="resultsBody"></tbody>
+  </table>
+  <div id="doneMsg"></div>
+  <div class="err" id="errMsg"></div>
+
+<script>
+const $overlay    = document.getElementById('overlay');
+const $active     = document.getElementById('active');
+const $progress   = document.getElementById('progress');
+const $voiceName  = document.getElementById('voiceName');
+const $voiceState = document.getElementById('voiceState');
+const $table      = document.getElementById('resultsTable');
+const $body       = document.getElementById('resultsBody');
+const $doneMsg    = document.getElementById('doneMsg');
+const $errMsg     = document.getElementById('errMsg');
+
+const ENGINE = (new URLSearchParams(window.location.search).get('engine') || 'xtts').toLowerCase();
+
+// Header / switch-engine link
+document.getElementById('headline').textContent =
+  ENGINE === 'gemini' ? 'Gemini TTS voice sampler' : 'XTTS voice sampler';
+document.getElementById('subline').textContent =
+  ENGINE === 'gemini'
+    ? 'Each Gemini Flash TTS voice says its name and a short sentence. ⚠ each rating round is ~30 cloud API calls against your Gemini key.'
+    : 'Each voice says its name and a short sentence. Rate it 1–9; results land in the table below.';
+const $sw = document.getElementById('switchLink');
+const otherEngine = ENGINE === 'gemini' ? 'xtts' : 'gemini';
+$sw.innerHTML = `→ <a href="/sample?engine=${otherEngine}" style="color:#7fff7f;text-decoration:none;">rank ${otherEngine === 'gemini' ? 'Gemini' : 'XTTS'} voices instead</a>`;
+document.title = (ENGINE === 'gemini' ? 'Gemini' : 'XTTS') + ' voice sampler';
+
+function sentenceFor(name) {
+  return `Hi, my name is ${name}. I can read your text out loud, clearly and at your pace.`;
+}
+
+function concatU8(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0); out.set(b, a.length); return out;
+}
+
+function parseWavHeader(buf) {
+  if (buf.length < 44) return null;
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  if (dv.getUint32(0, false) !== 0x52494646) return null;
+  if (dv.getUint32(8, false) !== 0x57415645) return null;
+  const sampleRate = dv.getUint32(24, true);
+  let off = 12;
+  while (off + 8 <= buf.length) {
+    const id = String.fromCharCode(buf[off], buf[off+1], buf[off+2], buf[off+3]);
+    const sz = dv.getUint32(off+4, true);
+    if (id === 'data') return { sampleRate, dataOffset: off + 8 };
+    if (sz === 0xFFFFFFFF) return null;
+    off += 8 + sz;
+  }
+  return null;
+}
+
+async function streamAndPlay(ctx, url, abortCtrl) {
+  const r = await fetch(url, { signal: abortCtrl.signal });
+  if (!r.ok) throw new Error(await r.text());
+  const reader = r.body.getReader();
+  let header = null, buf = new Uint8Array(0), nextStart = 0, lastSrc = null;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf = concatU8(buf, value);
+    if (!header) {
+      header = parseWavHeader(buf);
+      if (!header) continue;
+      buf = buf.subarray(header.dataOffset);
+      nextStart = ctx.currentTime + 0.05;
+    }
+    const evenLen = buf.length - (buf.length % 2);
+    if (evenLen < 2) continue;
+    const pcm = buf.subarray(0, evenLen);
+    buf = buf.subarray(evenLen);
+    const ab = pcm.buffer.slice(pcm.byteOffset, pcm.byteOffset + evenLen);
+    const samples = new Int16Array(ab);
+    const floats = new Float32Array(samples.length);
+    for (let i = 0; i < samples.length; i++) floats[i] = samples[i] / 32768;
+    const abuf = ctx.createBuffer(1, floats.length, header.sampleRate);
+    abuf.getChannelData(0).set(floats);
+    const src = ctx.createBufferSource();
+    src.buffer = abuf;
+    src.connect(ctx.destination);
+    const startAt = Math.max(ctx.currentTime + 0.01, nextStart);
+    src.start(startAt);
+    nextStart = startAt + abuf.duration;
+    lastSrc = src;
+  }
+  if (lastSrc) {
+    await new Promise(res => lastSrc.addEventListener('ended', res));
+  }
+}
+
+function waitForKey() {
+  return new Promise(resolve => {
+    const handler = (e) => {
+      const k = e.key;
+      if (/^[1-9]$/.test(k) || k === ' ' || k === 'Escape'
+          || k === 'n' || k === 'N') {
+        e.preventDefault();
+        document.removeEventListener('keydown', handler, true);
+        resolve(k);
+      }
+    };
+    document.addEventListener('keydown', handler, true);
+  });
+}
+
+function renderResults(results, finalized) {
+  $table.style.display = '';
+  $body.innerHTML = '';
+  const sorted = [...results];
+  if (finalized) sorted.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
+  for (const r of sorted) {
+    const tr = document.createElement('tr');
+    const idx = document.createElement('td');
+    idx.textContent = results.indexOf(r) + 1;
+    const name = document.createElement('td');
+    name.textContent = r.voice;
+    const score = document.createElement('td');
+    score.className = 'score';
+    if (r.score === null || r.score === undefined) {
+      score.textContent = '—';
+    } else {
+      score.textContent = r.score;
+      const bar = document.createElement('span');
+      bar.className = 'bar';
+      bar.style.width = (r.score * 12) + 'px';
+      score.appendChild(bar);
+    }
+    tr.appendChild(idx); tr.appendChild(name); tr.appendChild(score);
+    $body.appendChild(tr);
+  }
+}
+
+async function singleShotAndPlay(ctx, body, abortCtrl) {
+  // Gemini: POST /tts returns a complete WAV blob in one go.
+  const r = await fetch('/tts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: abortCtrl.signal,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const arrayBuf = await r.arrayBuffer();
+  // decodeAudioData mutates the input buffer in some browsers; clone to be safe.
+  const decoded = await ctx.decodeAudioData(arrayBuf.slice(0));
+  const src = ctx.createBufferSource();
+  src.buffer = decoded;
+  src.connect(ctx.destination);
+  src.start();
+  await new Promise(res => src.addEventListener('ended', res));
+}
+
+function loadVoiceList() {
+  return fetch('/voices').then(r => r.json()).then(v => {
+    if (ENGINE === 'gemini') {
+      if (!v.gemini || !v.gemini.enabled) {
+        throw new Error('Gemini backend not enabled (set GEMINI_API_KEY in .env)');
+      }
+      // Each entry: {name, style}
+      return v.gemini.voices.map(x => ({ name: x.name, label: `${x.name} · ${x.style}` }));
+    }
+    const xtts = (v.xtts && v.xtts.recommended) || [];
+    if (!xtts.length) throw new Error('no XTTS recommended voices available');
+    return xtts.map(n => ({ name: n, label: n }));
+  });
+}
+
+async function run() {
+  let voices;
+  try {
+    voices = await loadVoiceList();
+  } catch (e) {
+    $errMsg.textContent = 'failed to load voice list: ' + e.message;
+    return;
+  }
+
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new Ctx();
+  if (ctx.state === 'suspended') {
+    try { await ctx.resume(); } catch (e) {}
+  }
+
+  const results = [];
+  for (let i = 0; i < voices.length; i++) {
+    const v = voices[i];
+    $progress.textContent = `Voice ${i+1} of ${voices.length}`;
+    $voiceName.textContent = v.label;
+    let entry = { voice: v.name, label: v.label, score: null };
+    results.push(entry);
+    renderResults(results, false);
+
+    let scored = false;
+    while (!scored) {
+      $voiceState.textContent = ENGINE === 'gemini' ? 'calling Gemini…' : 'synthesizing…';
+      const abortCtrl = new AbortController();
+      try {
+        if (ENGINE === 'gemini') {
+          await singleShotAndPlay(ctx, {
+            text: sentenceFor(v.name), engine: 'gemini',
+            speaker: v.name, speed: 1.0,
+          }, abortCtrl);
+        } else {
+          const pr = await fetch('/tts/prepare', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              text: sentenceFor(v.name), engine: 'xtts',
+              speaker: v.name, speed: 1.0, language: 'en',
+            }),
+          });
+          if (!pr.ok) throw new Error(await pr.text());
+          const { url } = await pr.json();
+          $voiceState.textContent = 'playing… rate 1–9, Space to replay';
+          await streamAndPlay(ctx, url, abortCtrl);
+        }
+      } catch (e) {
+        $voiceState.textContent = 'error: ' + e.message;
+      }
+      $voiceState.textContent = 'rate 1–9 · Space replay · N skip · Esc stop';
+      const key = await waitForKey();
+      if (/^[1-9]$/.test(key)) {
+        entry.score = parseInt(key, 10);
+        scored = true;
+      } else if (key === 'n' || key === 'N') {
+        entry.score = null;
+        scored = true;
+      } else if (key === 'Escape') {
+        saveScores(results);
+        renderResults(results, true);
+        $doneMsg.className = 'done';
+        $doneMsg.textContent = `stopped after ${results.length} voice(s) — scores saved.`;
+        $active.style.display = 'none';
+        return;
+      }
+      // Space falls through → replay
+      renderResults(results, false);
+    }
+  }
+
+  $active.style.display = 'none';
+  saveScores(results);
+  renderResults(results, true);
+  $doneMsg.className = 'done';
+  $doneMsg.textContent = `Done — ${results.filter(r=>r.score!=null).length} of ${results.length} rated. Scores saved.`;
+}
+
+function saveScores(results) {
+  // Persist to localStorage so the main page can sort voices by score later.
+  try {
+    const key = ENGINE === 'gemini' ? 'voiceScores.gemini' : 'voiceScores.xtts';
+    const existing = JSON.parse(localStorage.getItem(key) || '{}');
+    for (const r of results) {
+      if (r.score == null) continue;
+      existing[r.voice] = { score: r.score, t: Date.now() };
+    }
+    localStorage.setItem(key, JSON.stringify(existing));
+  } catch (e) {
+    console.warn('saveScores failed:', e);
+  }
+}
+
+document.getElementById('start').addEventListener('click', () => {
+  $overlay.style.display = 'none';
+  $active.style.display = '';
+  run().catch(e => { $errMsg.textContent = 'aborted: ' + e.message; });
+});
 </script>
 </body>
 </html>
@@ -656,6 +1117,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/" or self.path.startswith("/index"):
             body = HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/sample" or self.path.startswith("/sample?"):
+            body = SAMPLER_HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
