@@ -14,6 +14,7 @@ import io
 import json
 import os
 import re
+import secrets
 import struct
 import sys
 import threading
@@ -44,6 +45,200 @@ _load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 # ---------------------------------------------------------------------------
+# Passkey auth — gates every route except /login and /auth. The browser holds
+# a random per-process session token in a cookie; the actual passkey never
+# leaves the server. Restart invalidates all sessions.
+# ---------------------------------------------------------------------------
+PASSKEY = os.environ.get("READ_XTTS_PASSKEY", "1200gulf10129trails")
+SESSION_TOKEN = secrets.token_urlsafe(32)
+AUTH_COOKIE = "rxauth"
+
+LOGIN_HTML = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0a">
+<title>Read aloud — sign in</title>
+<style>
+body{background:#0a0a0a;color:#e6e6e6;font:14px system-ui,sans-serif;
+     display:flex;align-items:center;justify-content:center;
+     min-height:100vh;margin:0;padding:16px;box-sizing:border-box;
+     -webkit-text-size-adjust:100%}
+form{background:#161616;padding:24px 24px;border-radius:10px;
+     border:1px solid #2a2a2a;width:100%;max-width:340px;box-sizing:border-box}
+h1{margin:0 0 16px;font-size:16px;font-weight:600}
+input[type=password]{width:100%;box-sizing:border-box;background:#0a0a0a;
+     color:#e6e6e6;border:1px solid #333;border-radius:6px;padding:12px;
+     font:16px monospace}
+button{margin-top:14px;width:100%;padding:12px;background:#2a5fb4;color:#fff;
+     border:none;border-radius:6px;font:16px sans-serif;cursor:pointer;
+     min-height:44px}
+.err{color:#ff7a7a;margin-top:10px;font-size:12px;min-height:1em}
+</style></head><body>
+<form method="POST" action="/auth">
+  <h1>Read aloud — sign in</h1>
+  <input name="passkey" type="password" autofocus placeholder="passkey" autocomplete="current-password">
+  <button>Unlock</button>
+  <div class="err">__ERROR__</div>
+</form></body></html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Voice ratings — bridge from the browser's localStorage to a disk file so
+# other tools (debate.py) can pick top-rated voices. The rating UI saves to
+# localStorage; the main page POSTs that to /scores; we persist it here.
+# ---------------------------------------------------------------------------
+
+SCORES_PATH = Path(__file__).resolve().parent / "voice_scores.json"
+VOICES_DIR = Path(__file__).resolve().parent / "voices"
+HISTORY_DIR = Path(__file__).resolve().parent / "history"
+HISTORY_MAX = 100  # rolling cap; oldest pruned after each successful save
+_scores_lock = threading.Lock()
+_history_lock = threading.Lock()
+
+
+def list_custom_voices() -> list[dict]:
+    """Discover cloning reference WAVs in voices/. Each entry: {name, file}."""
+    if not VOICES_DIR.is_dir():
+        return []
+    return [{"name": p.stem, "file": p.name}
+            for p in sorted(VOICES_DIR.glob("*.wav"))]
+
+
+def resolve_custom_voice(filename: str) -> Path | None:
+    """Return absolute path for `filename` iff it's a real WAV under voices/.
+
+    Rejects path traversal — only bare filenames are accepted; the resolved
+    path must still sit directly under VOICES_DIR.
+    """
+    if not filename or "/" in filename or "\\" in filename or filename.startswith("."):
+        return None
+    candidate = (VOICES_DIR / filename).resolve()
+    if candidate.parent != VOICES_DIR.resolve():
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
+
+
+def load_scores() -> dict:
+    """Return {'xtts': {voice: {score,t}}, 'gemini': {...}} from disk."""
+    try:
+        with _scores_lock:
+            if SCORES_PATH.exists():
+                return json.loads(SCORES_PATH.read_text() or "{}")
+    except Exception:
+        pass
+    return {"xtts": {}, "gemini": {}}
+
+
+def merge_scores(incoming: dict) -> dict:
+    """Merge posted scores into the on-disk file (newer timestamp wins).
+
+    Per-voice record can carry two independent ratings, each with its own
+    timestamp so the two channels don't fight each other:
+      score / t          — sampler's 1-9 audition rating (/sample page)
+      stars / stars_t    — main page's 1-5 post-generation rating
+    """
+    with _scores_lock:
+        current = {"xtts": {}, "gemini": {}}
+        if SCORES_PATH.exists():
+            try:
+                current = json.loads(SCORES_PATH.read_text() or "{}")
+            except Exception:
+                pass
+        for engine in ("xtts", "gemini"):
+            cur = current.setdefault(engine, {})
+            for voice, rec in (incoming.get(engine) or {}).items():
+                if not isinstance(rec, dict):
+                    continue
+                slot = cur.setdefault(voice, {})
+                if "score" in rec:
+                    t = rec.get("t", 0)
+                    if t >= slot.get("t", 0):
+                        slot["score"] = rec["score"]
+                        slot["t"] = t
+                if "stars" in rec:
+                    t = rec.get("stars_t", 0)
+                    if t >= slot.get("stars_t", 0):
+                        try:
+                            n = int(rec["stars"])
+                        except (TypeError, ValueError):
+                            continue
+                        if 1 <= n <= 5:
+                            slot["stars"] = n
+                            slot["stars_t"] = t
+        SCORES_PATH.write_text(json.dumps(current, indent=2))
+        return current
+
+
+# ---------------------------------------------------------------------------
+# Generation history — every successful synth is written to history/ as a
+# .wav plus a .json sidecar. The web UI reads /history to render a playable
+# list. Bounded by HISTORY_MAX so the directory doesn't grow unbounded.
+# ---------------------------------------------------------------------------
+
+_HIST_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}_[0-9a-f]{8}$")
+
+
+def _history_id_safe(uid: str) -> bool:
+    return bool(_HIST_ID_RE.match(uid or ""))
+
+
+def save_history(*, text: str, engine: str, voice: str, speed: float,
+                 language: str, wav_bytes: bytes, sample_rate: int,
+                 duration_seconds: float) -> str:
+    """Write a WAV + sidecar JSON describing one generation; return its id."""
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    base = (time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+            + "_" + uuid.uuid4().hex[:8])
+    meta = {
+        "id": base,
+        "created_at": now,
+        "engine": engine,
+        "voice": voice or "",
+        "speed": float(speed),
+        "language": language or "",
+        "text": text,
+        "sample_rate": int(sample_rate),
+        "duration_seconds": float(duration_seconds),
+        "bytes": len(wav_bytes),
+    }
+    with _history_lock:
+        (HISTORY_DIR / f"{base}.wav").write_bytes(wav_bytes)
+        (HISTORY_DIR / f"{base}.json").write_text(json.dumps(meta))
+        _prune_history_locked()
+    return base
+
+
+def _prune_history_locked() -> None:
+    """Trim history/ to HISTORY_MAX entries by oldest mtime. Caller holds lock."""
+    jsons = sorted(HISTORY_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    while len(jsons) > HISTORY_MAX:
+        oldest = jsons.pop(0)
+        for p in (oldest, oldest.with_suffix(".wav")):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def list_history() -> list[dict]:
+    """Return history metadata newest-first, capped at HISTORY_MAX entries."""
+    if not HISTORY_DIR.is_dir():
+        return []
+    items: list[dict] = []
+    for jp in sorted(HISTORY_DIR.glob("*.json"),
+                     key=lambda p: p.stat().st_mtime, reverse=True)[:HISTORY_MAX]:
+        try:
+            items.append(json.loads(jp.read_text()))
+        except Exception:
+            continue
+    return items
+
+
+# ---------------------------------------------------------------------------
 # Lazy XTTS-v2 loader. Loading takes ~10s; we keep a single instance warm.
 # ---------------------------------------------------------------------------
 
@@ -51,6 +246,33 @@ _tts_lock = threading.Lock()
 _tts = None
 _tts_device: str = "cpu"
 _tts_speakers: list[str] = []
+
+
+def _patch_xtts_audio_loader() -> None:
+    """Swap XTTS's torchaudio-based audio loader for a soundfile-based one.
+
+    torchaudio 2.11 routes file loads through torchcodec, which requires
+    FFmpeg shared libs the system doesn't fully ship. We only ever feed XTTS
+    pre-cleaned WAVs from voices/, so a soundfile + torch.functional.resample
+    path is sufficient and avoids the FFmpeg dependency entirely.
+    """
+    import numpy as np
+    import soundfile as sf
+    import torch
+    import torchaudio.functional as taf
+    from TTS.tts.models import xtts as _xtts
+
+    def _load_audio(audiopath, sampling_rate):
+        data, lsr = sf.read(str(audiopath), always_2d=True)
+        audio = torch.from_numpy(data.T.astype(np.float32))
+        if audio.size(0) != 1:
+            audio = torch.mean(audio, dim=0, keepdim=True)
+        if lsr != sampling_rate:
+            audio = taf.resample(audio, lsr, sampling_rate)
+        audio.clip_(-1, 1)
+        return audio
+
+    _xtts.load_audio = _load_audio
 
 
 def get_tts():
@@ -66,6 +288,7 @@ def get_tts():
         print(f"[xtts] loading model on {_tts_device}…", file=sys.stderr)
         t0 = time.time()
         _tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(_tts_device)
+        _patch_xtts_audio_loader()
         try:
             _tts_speakers = list(_tts.synthesizer.tts_model.speaker_manager.name_to_id.keys())
         except Exception:
@@ -75,17 +298,26 @@ def get_tts():
     return _tts
 
 
-def synth_wav(text: str, speaker: str, language: str = "en",
-              speed: float = 1.0) -> bytes:
-    """Synthesize `text` with `speaker`, return WAV bytes (mono 24 kHz int16).
+def synth_wav(text: str, speaker: str | None, language: str = "en",
+              speed: float = 1.0, *, speaker_wav: str | None = None) -> bytes:
+    """Synthesize `text`, return WAV bytes (mono 24 kHz int16).
 
-    `speed` is XTTS-v2's native rate multiplier (1.0 = default). Clamped to
-    a sensible range so we don't ship garbled audio.
+    Pass either `speaker` (built-in XTTS speaker name) or `speaker_wav` (path
+    to a reference WAV for zero-shot cloning). `speed` is clamped to 0.5–2.0.
     """
     tts = get_tts()
     import numpy as np
     s = max(0.5, min(2.0, float(speed)))
-    wav = tts.tts(text=text, speaker=speaker, language=language, speed=s)
+    if speaker_wav:
+        cache_dir = VOICES_DIR / ".cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        wav = tts.tts(text=text,
+                      speaker=Path(speaker_wav).stem,
+                      speaker_wav=speaker_wav,
+                      voice_dir=str(cache_dir),
+                      language=language, speed=s)
+    else:
+        wav = tts.tts(text=text, speaker=speaker, language=language, speed=s)
     arr = np.asarray(wav, dtype=np.float32)
     arr = np.clip(arr, -1.0, 1.0)
     pcm = (arr * 32767.0).astype(np.int16).tobytes()
@@ -259,37 +491,75 @@ def gemini_available() -> bool:
         return False
 
 
-def synth_gemini(text: str, voice: str = "Aoede") -> bytes:
-    """Synthesize via gemini-3.1-flash-tts-preview. Returns WAV bytes."""
-    from google import genai
-    from google.genai import types
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+def _gemini_synth_chunk(client, types_mod, text: str, voice: str) -> bytes:
+    """Call Gemini TTS once and return raw 24 kHz mono int16 PCM bytes."""
     resp = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=text,
-        config=types.GenerateContentConfig(
+        config=types_mod.GenerateContentConfig(
             response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+            speech_config=types_mod.SpeechConfig(
+                voice_config=types_mod.VoiceConfig(
+                    prebuilt_voice_config=types_mod.PrebuiltVoiceConfig(
                         voice_name=voice,
                     ),
                 ),
             ),
         ),
     )
-    # The audio comes back as raw PCM in inline_data. Gemini TTS returns
-    # mono 24 kHz signed 16-bit PCM as of writing.
     parts = resp.candidates[0].content.parts
-    pcm: bytes | None = None
     for p in parts:
         d = getattr(p, "inline_data", None)
         if d and d.data:
-            pcm = d.data if isinstance(d.data, (bytes, bytearray)) else bytes(d.data)
-            break
-    if pcm is None:
-        raise RuntimeError("Gemini response had no inline audio data")
-    return _wav_wrap(pcm, n_channels=1, sample_width=2, sample_rate=24000)
+            return d.data if isinstance(d.data, (bytes, bytearray)) else bytes(d.data)
+    raise RuntimeError("Gemini response had no inline audio data")
+
+
+def synth_gemini(text: str, voice: str = "Aoede") -> bytes:
+    """Synthesize via Gemini TTS, returning a single WAV (24 kHz mono int16).
+
+    Always chunks via `split_for_synth` and concatenates raw PCM, even for
+    short input. Single-shot calls hit Gemini's per-request audio-output
+    budget on long text — chunking dodges both the truncation and the
+    documented "quality drifts after a few minutes" caveat.
+    """
+    from google import genai
+    from google.genai import types
+    chunks = split_for_synth(text)
+    if not chunks:
+        raise RuntimeError("empty text")
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    pcm_parts: list[bytes] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        t0 = time.time()
+        last_err: Exception | None = None
+        # One retry on transient failure (network blip, transient 5xx). The
+        # Gemini SDK raises a single Exception subclass for everything; we
+        # don't try to discriminate — just don't loop forever.
+        for attempt in (1, 2):
+            try:
+                pcm = _gemini_synth_chunk(client, types, chunk, voice)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt == 1:
+                    print(f"[gemini-tts] chunk {idx}/{len(chunks)} attempt 1 "
+                          f"failed ({type(e).__name__}: {e}); retrying…",
+                          file=sys.stderr)
+                    time.sleep(1.0)
+        if last_err is not None:
+            raise RuntimeError(
+                f"Gemini chunk {idx}/{len(chunks)} failed after retry: "
+                f"{type(last_err).__name__}: {last_err}"
+            ) from last_err
+        dt = time.time() - t0
+        audio_ms = (len(pcm) / (2 * 24000)) * 1000.0
+        print(f"[gemini-tts] chunk {idx}/{len(chunks)}: {len(chunk)} chars → "
+              f"{audio_ms:.0f}ms audio in {dt:.2f}s", file=sys.stderr)
+        pcm_parts.append(pcm)
+    return _wav_wrap(b"".join(pcm_parts), n_channels=1, sample_width=2,
+                     sample_rate=24000)
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +570,8 @@ HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e0e12">
 <title>Read aloud (XTTS-v2 local)</title>
 <style>
   :root {
@@ -312,20 +584,25 @@ HTML = r"""<!doctype html>
     --bad: #ff7f7f;
   }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
-    font-family: -apple-system, "Segoe UI", system-ui, sans-serif; }
-  body { max-width: 980px; margin: 0 auto; padding: 24px; }
-  h1 { margin: 0 0 4px; font-size: 22px; font-weight: 600; }
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    -webkit-text-size-adjust: 100%; }
+  body { max-width: 980px; margin: 0 auto; padding: 24px;
+    padding-left: max(24px, env(safe-area-inset-left));
+    padding-right: max(24px, env(safe-area-inset-right)); }
+  h1 { margin: 0 0 4px; font-size: 22px; font-weight: 600; line-height: 1.25; }
   .sub { color: var(--dim); font-size: 13px; margin-bottom: 16px; }
+  /* 16px font on textarea/inputs avoids iOS Safari's zoom-on-focus. */
   textarea { width: 100%; min-height: 180px; resize: vertical;
     background: var(--panel); color: var(--fg); border: 1px solid var(--rule);
-    border-radius: 10px; padding: 12px 14px; font: inherit; font-size: 15px;
+    border-radius: 10px; padding: 12px 14px; font: inherit; font-size: 16px;
     line-height: 1.4; box-sizing: border-box; }
   textarea:focus { outline: 2px solid var(--accent); border-color: transparent; }
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
     margin-top: 12px; }
+  select, button, input[type=range] { font-size: 16px; }
   select, button { background: var(--panel); color: var(--fg);
     border: 1px solid var(--rule); border-radius: 8px; padding: 9px 14px;
-    font: inherit; }
+    font: inherit; min-height: 40px; }
   button.primary { background: var(--accent); color: #0e1a0e; border: 0;
     font-weight: 600; cursor: pointer; }
   button:disabled { opacity: 0.45; cursor: not-allowed; }
@@ -334,6 +611,71 @@ HTML = r"""<!doctype html>
   .status.err { color: var(--bad); }
   audio { width: 100%; max-width: 600px; margin-top: 14px; display: block; }
   footer { color: var(--dim); font-size: 12px; margin-top: 18px; }
+
+  .rating { display: flex; align-items: center; gap: 10px; margin-top: 14px;
+    flex-wrap: wrap; }
+  .rating-label { color: var(--dim); font-size: 13px; }
+  .rating-hint { color: var(--dim); font-size: 12px; }
+  .stars { display: inline-flex; gap: 2px; }
+  /* Each star is a button. Default to "dim" outline; flip to accent when
+     the row is showing a rating up to N. Hover preview uses :hover on the
+     row + ~ sibling state so trailing stars stay dim until pointed at. */
+  .star { background: transparent; border: 0; padding: 2px 4px;
+    font-size: 22px; line-height: 1; cursor: pointer; color: var(--rule);
+    min-height: 0; transition: color 0.08s; }
+  .star:hover, .star:focus { color: var(--fg); outline: none; }
+  .stars.filled-1 .star:nth-child(-n+1),
+  .stars.filled-2 .star:nth-child(-n+2),
+  .stars.filled-3 .star:nth-child(-n+3),
+  .stars.filled-4 .star:nth-child(-n+4),
+  .stars.filled-5 .star:nth-child(-n+5) { color: var(--accent); }
+
+  details.history { margin-top: 18px; }
+  details.history > summary { color: var(--dim); font-size: 13px;
+    cursor: pointer; padding: 6px 0; user-select: none; list-style: none; }
+  details.history > summary::-webkit-details-marker { display: none; }
+  details.history > summary::before { content: "▸ "; display: inline-block;
+    width: 14px; transition: transform 0.15s; }
+  details.history[open] > summary::before { transform: rotate(90deg); }
+  details.history > summary:hover { color: var(--fg); }
+  .hist-count { color: var(--dim); margin-left: 4px; }
+  .hist-list { display: flex; flex-direction: column; gap: 8px;
+    margin-top: 8px; max-height: 360px; overflow: auto; padding-right: 4px; }
+  .hist-entry { display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; background: var(--panel); border: 1px solid var(--rule);
+    border-radius: 8px; }
+  .hist-play { flex: 0 0 36px; height: 36px; min-height: 0; padding: 0;
+    background: var(--accent); color: #0e1a0e; border: 0; border-radius: 6px;
+    font-weight: 700; cursor: pointer; font-size: 14px; }
+  .hist-play:disabled { opacity: 0.45; cursor: not-allowed; }
+  .hist-meta { flex: 1 1 auto; min-width: 0; }
+  .hist-line1 { font-size: 12px; color: var(--dim);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hist-line2 { font-size: 13px; color: var(--fg); margin-top: 2px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; line-height: 1.35; }
+  .hist-dl { color: var(--dim); text-decoration: none; font-size: 18px;
+    padding: 4px 8px; flex: 0 0 auto; line-height: 1; }
+  .hist-dl:hover { color: var(--accent); }
+  .hist-empty { color: var(--dim); font-size: 13px; padding: 8px 4px; }
+
+  @media (max-width: 640px) {
+    body { padding: 14px;
+      padding-left: max(14px, env(safe-area-inset-left));
+      padding-right: max(14px, env(safe-area-inset-right)); }
+    h1 { font-size: 20px; }
+    .row { gap: 8px; margin-top: 10px; }
+    /* Stack the controls into rows that breathe; main buttons go full width
+       so they're easy to hit with a thumb. */
+    #voice { flex: 1 1 100%; min-width: 0; }
+    #read, #random, #stop, #save, #clear { flex: 1 1 calc(50% - 4px); }
+    #read { order: -1; }
+    .row label[for=voice] { display: none; }
+    .row label.status { flex: 1 1 100%; margin-left: 0; justify-content: space-between; }
+    .row label.status input[type=range] { flex: 1; width: auto; }
+    #status { flex: 1 1 100%; margin-left: 0; }
+    footer { font-size: 11px; }
+  }
 </style>
 </head>
 <body>
@@ -344,6 +686,7 @@ HTML = r"""<!doctype html>
     <label for="voice" class="status">Voice:</label>
     <select id="voice"></select>
     <button id="read" class="primary">Read</button>
+    <button id="random" title="Pick a random voice with no star rating yet and Read">🎲 Try</button>
     <button id="stop">Stop</button>
     <button id="save" disabled title="Save the last generated audio as a WAV file">Save</button>
     <button id="clear" title="Clear the text; voice stays as selected">Clear</button>
@@ -355,6 +698,26 @@ HTML = r"""<!doctype html>
     <span class="status" id="status">ready</span>
   </div>
   <audio id="out" controls preload="auto"></audio>
+
+  <div class="rating" id="rating" hidden>
+    <span class="rating-label" id="ratingLabel">Rate this voice:</span>
+    <div class="stars" id="stars" role="radiogroup" aria-label="rating">
+      <button class="star" type="button" data-n="1" aria-label="1 star">★</button>
+      <button class="star" type="button" data-n="2" aria-label="2 stars">★</button>
+      <button class="star" type="button" data-n="3" aria-label="3 stars">★</button>
+      <button class="star" type="button" data-n="4" aria-label="4 stars">★</button>
+      <button class="star" type="button" data-n="5" aria-label="5 stars">★</button>
+    </div>
+    <span class="rating-hint" id="ratingHint"></span>
+  </div>
+
+  <details class="history" id="history">
+    <summary>History <span id="hist_count" class="hist-count"></span></summary>
+    <div class="hist-list" id="hist_list">
+      <div class="hist-empty">No saved audio yet.</div>
+    </div>
+  </details>
+
   <footer>
     <span id="meta">device: …</span>
     &nbsp;·&nbsp; first synth loads the model (~10s); subsequent ones are fast.
@@ -376,6 +739,23 @@ let activeStream = null;
 // Last finished audio, ready to be downloaded as a single WAV file.
 // {blob, voice, engine} once a generation completes.
 let lastAudio = null;
+
+// One long-lived AudioContext, primed inside a user gesture before any
+// `await`. iOS Safari gates Web Audio on user activation — a context first
+// touched after an awaited fetch stays `suspended` forever, so streaming
+// plays silently. Calling resume() must also happen synchronously inside
+// the gesture; awaiting it does not count.
+let audioCtx = null;
+function getAudioCtx() {
+  if (!audioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new Ctx();
+  }
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(() => {});
+  }
+  return audioCtx;
+}
 
 function setStatus(msg, cls='') {
   $status.className = 'status' + (cls ? ' ' + cls : '');
@@ -423,8 +803,27 @@ function labelFor(item) {
   return item.label;
 }
 
+// Push whatever ratings are in localStorage up to the server so disk-backed
+// tools (debate.py) can read them. Runs once on page load; cheap and idempotent.
+async function syncScoresToServer() {
+  try {
+    const payload = {
+      xtts: loadScores('xtts'),
+      gemini: loadScores('gemini'),
+    };
+    const hasAny = Object.keys(payload.xtts).length || Object.keys(payload.gemini).length;
+    if (!hasAny) return;
+    await fetch('/scores', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) { /* non-fatal */ }
+}
+
 async function loadVoices() {
   try {
+    syncScoresToServer();   // fire-and-forget; persists ratings to disk
     const r = await fetch('/voices');
     if (!r.ok) throw new Error(await r.text());
     const data = await r.json();
@@ -436,7 +835,25 @@ async function loadVoices() {
 
     const xttsScores = loadScores('xtts');
     const geminiScores = loadScores('gemini');
-    let topXtts = null, topGemini = null;
+    let topXtts = null, topGemini = null, topCustom = null;
+
+    // Custom cloned voices first (most prominent). Score namespace is shared
+    // with XTTS so a rated clone competes against the built-ins.
+    if (data.xtts.custom && data.xtts.custom.length) {
+      const og = document.createElement('optgroup');
+      og.label = 'Custom (cloned)';
+      const items = data.xtts.custom.map(c => ({
+        name: c.name, label: c.name, file: c.file,
+      }));
+      const sorted = sortVoices(items, xttsScores, null);
+      for (const it of sorted) {
+        const o = makeOption('xtts', it.name, labelFor(it));
+        o.dataset.speakerWav = it.file;
+        og.appendChild(o);
+      }
+      $voice.appendChild(og);
+      topCustom = sorted[0] || null;
+    }
 
     if (data.gemini.enabled) {
       const og = document.createElement('optgroup');
@@ -467,18 +884,20 @@ async function loadVoices() {
 
     if (data.xtts.error) setStatus('xtts: ' + data.xtts.error, 'err');
 
-    // Default selection: highest-rated voice across engines, tiebreaker XTTS
-    // (local, free). With no ratings yet, both scores tie at -Infinity and
-    // XTTS wins, so first-time users land on an XTTS voice as before.
+    // Default selection: highest-rated voice across engines. On ties (e.g.
+    // a fresh install with no ratings), prefer custom clones, then XTTS
+    // built-ins, then Gemini — so first-time users land on the voice they
+    // just added.
     const candidates = [];
-    if (topXtts)   candidates.push({ engine: 'xtts',   it: topXtts });
-    if (topGemini) candidates.push({ engine: 'gemini', it: topGemini });
+    if (topCustom) candidates.push({ kind: 'custom', engine: 'xtts',   it: topCustom });
+    if (topXtts)   candidates.push({ kind: 'xtts',   engine: 'xtts',   it: topXtts });
+    if (topGemini) candidates.push({ kind: 'gemini', engine: 'gemini', it: topGemini });
+    const kindRank = { custom: 0, xtts: 1, gemini: 2 };
     candidates.sort((a, b) => {
       const sa = a.it.score == null ? -Infinity : a.it.score;
       const sb = b.it.score == null ? -Infinity : b.it.score;
       if (sb !== sa) return sb - sa;
-      if (a.engine !== b.engine) return a.engine === 'xtts' ? -1 : 1;
-      return 0;
+      return kindRank[a.kind] - kindRank[b.kind];
     });
     if (candidates.length) {
       $voice.value = candidates[0].engine + '::' + candidates[0].it.name;
@@ -534,11 +953,9 @@ function concatU8(a, b) {
 // resulting playback is gapless. Returns when the server closes the stream
 // (audio may still be playing out afterwards).
 async function playXttsStream(url, t0) {
-  const Ctx = window.AudioContext || window.webkitAudioContext;
-  const ctx = new Ctx();
-  if (ctx.state === 'suspended') {
-    try { await ctx.resume(); } catch (e) {}
-  }
+  // Assumes getAudioCtx() was already called in the click handler. Reusing
+  // the singleton keeps the iOS gesture chain intact across awaits.
+  const ctx = getAudioCtx();
   const abortCtrl = new AbortController();
   const state = { ctx, sources: [], aborted: false, abortCtrl };
   activeStream = state;
@@ -644,13 +1061,170 @@ function enableSaveButton(on) {
   if (btn) btn.disabled = !on;
 }
 
+// --- Star rating -----------------------------------------------------------
+// Server-side voice_scores.json mirrored here so the rating bar can show the
+// current star count without re-fetching on every Read.
+const serverScores = { xtts: {}, gemini: {} };
+let currentRating = null;   // { engine, voice } of the most recent Read
+
+async function loadServerScores() {
+  try {
+    const r = await fetch('/scores');
+    if (!r.ok) return;
+    const data = await r.json();
+    for (const eng of ['xtts', 'gemini']) {
+      Object.assign(serverScores[eng] = serverScores[eng] || {}, data[eng] || {});
+    }
+  } catch (e) {
+    // Non-fatal — rating bar will just start unhighlighted.
+  }
+}
+
+const $rating     = document.getElementById('rating');
+const $stars      = document.getElementById('stars');
+const $ratingLabel = document.getElementById('ratingLabel');
+const $ratingHint = document.getElementById('ratingHint');
+
+function currentStarsFor(engine, voice) {
+  const rec = (serverScores[engine] || {})[voice];
+  return rec && Number.isInteger(rec.stars) ? rec.stars : 0;
+}
+
+function setStarsFilled(n) {
+  $stars.classList.remove('filled-1','filled-2','filled-3','filled-4','filled-5');
+  if (n >= 1 && n <= 5) $stars.classList.add('filled-' + n);
+}
+
+function showRatingFor(engine, voice) {
+  if (!voice) { $rating.hidden = true; currentRating = null; return; }
+  currentRating = { engine, voice };
+  $ratingLabel.textContent = `Rate ${voice}:`;
+  const n = currentStarsFor(engine, voice);
+  setStarsFilled(n);
+  $ratingHint.textContent = n ? `${n}/5` : '';
+  $rating.hidden = false;
+}
+
+async function postRating(engine, voice, stars) {
+  const stars_t = Date.now();
+  const payload = { [engine]: { [voice]: { stars, stars_t } } };
+  // Update local cache immediately for snappy UI; server merge will agree.
+  const slot = (serverScores[engine] = serverScores[engine] || {});
+  slot[voice] = Object.assign({}, slot[voice] || {}, { stars, stars_t });
+  try {
+    await fetch('/scores', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    setStatus('rating save failed: ' + e.message, 'err');
+  }
+}
+
+$stars.addEventListener('click', (e) => {
+  const btn = e.target.closest('.star');
+  if (!btn || !currentRating) return;
+  const n = parseInt(btn.dataset.n, 10);
+  if (!(n >= 1 && n <= 5)) return;
+  setStarsFilled(n);
+  $ratingHint.textContent = `${n}/5 · saved`;
+  postRating(currentRating.engine, currentRating.voice, n);
+});
+
+// --- History ---------------------------------------------------------------
+
+const $histList  = document.getElementById('hist_list');
+const $histCount = document.getElementById('hist_count');
+
+function fmtHistTime(epoch) {
+  const d = new Date(epoch * 1000);
+  const now = new Date();
+  const t = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (d.toDateString() === now.toDateString()) return t;
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + t;
+}
+
+function previewText(s, max=140) {
+  s = (s || '').trim().replace(/\s+/g, ' ');
+  return s.length <= max ? s : s.slice(0, max - 1) + '…';
+}
+
+function playHistory(item) {
+  // A click handler — gesture chain is fresh, so $out.play() satisfies iOS.
+  stopActiveStream();
+  $out.pause();
+  $out.src = '/history/' + item.id + '.wav';
+  $out.playbackRate = parseFloat(document.getElementById('speed').value) || 1.0;
+  $out.play().catch(e => setStatus('play failed: ' + e.message, 'err'));
+  lastAudio = null;       // history entry isn't the "last generated" blob
+  enableSaveButton(false);
+  setStatus('history · ' + previewText(item.text, 60), 'ok');
+}
+
+async function refreshHistory() {
+  try {
+    const r = await fetch('/history');
+    if (!r.ok) return;
+    const { items } = await r.json();
+    $histList.innerHTML = '';
+    if (!items || !items.length) {
+      const empty = document.createElement('div');
+      empty.className = 'hist-empty';
+      empty.textContent = 'No saved audio yet.';
+      $histList.appendChild(empty);
+      $histCount.textContent = '';
+      return;
+    }
+    $histCount.textContent = '(' + items.length + ')';
+    for (const it of items) {
+      const row = document.createElement('div');
+      row.className = 'hist-entry';
+
+      const btn = document.createElement('button');
+      btn.className = 'hist-play';
+      btn.textContent = '▶';
+      btn.title = 'Play';
+      btn.addEventListener('click', () => playHistory(it));
+
+      const meta = document.createElement('div');
+      meta.className = 'hist-meta';
+      const l1 = document.createElement('div');
+      l1.className = 'hist-line1';
+      const dur = (it.duration_seconds || 0).toFixed(1) + 's';
+      l1.textContent = `${fmtHistTime(it.created_at)} · ${it.engine} · ${it.voice || '—'} · ${dur}`;
+      const l2 = document.createElement('div');
+      l2.className = 'hist-line2';
+      l2.textContent = previewText(it.text);
+      meta.appendChild(l1); meta.appendChild(l2);
+
+      const dl = document.createElement('a');
+      dl.className = 'hist-dl';
+      dl.href = '/history/' + it.id + '.wav';
+      const safeVoice = (it.voice || 'voice').replace(/[^\w-]+/g, '_');
+      dl.download = `read_${safeVoice}_${it.id}.wav`;
+      dl.textContent = '↓';
+      dl.title = 'Download';
+
+      row.appendChild(btn); row.appendChild(meta); row.appendChild(dl);
+      $histList.appendChild(row);
+    }
+  } catch (e) {
+    // Non-fatal — leave the previous list in place.
+  }
+}
+
 async function read() {
   const text = $text.value.trim();
   if (!text) { setStatus('paste text first', 'err'); return; }
+  // Prime the AudioContext while we're still inside the click handler.
+  // Doing this after any `await` would lose the iOS user-gesture grant.
+  getAudioCtx();
   stopActiveStream();
   $out.pause();
   lastAudio = null;
   enableSaveButton(false);
+  $rating.hidden = true;
   $read.disabled = true;
   setStatus('synthesizing…');
   const t0 = performance.now();
@@ -658,17 +1232,22 @@ async function read() {
     const opt = $voice.selectedOptions[0];
     const engine = opt ? opt.dataset.engine : 'xtts';
     const speaker = opt ? opt.dataset.voice : $voice.value;
+    const speakerWav = opt ? (opt.dataset.speakerWav || '') : '';
     const speed = parseFloat(document.getElementById('speed').value);
 
     if (engine === 'xtts') {
+      const body = { text, engine, speaker, speed, language: 'en' };
+      if (speakerWav) body.speaker_wav = speakerWav;
       const pr = await fetch('/tts/prepare', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, engine, speaker, speed, language: 'en' }),
+        body: JSON.stringify(body),
       });
       if (!pr.ok) throw new Error(await pr.text());
       const { url } = await pr.json();
       await playXttsStream(url, t0);
+      refreshHistory();
+      showRatingFor('xtts', speaker);
     } else {
       // Gemini: single-shot blob (cloud API returns one complete audio).
       const r = await fetch('/tts', {
@@ -686,6 +1265,8 @@ async function read() {
       await $out.play();
       const dt = (performance.now() - t0) / 1000;
       setStatus(`synthesized in ${dt.toFixed(1)}s (${(blob.size/1024).toFixed(0)} KB)`, 'ok');
+      refreshHistory();
+      showRatingFor('gemini', speaker);
     }
   } catch (e) {
     setStatus('synth failed: ' + e.message, 'err');
@@ -694,10 +1275,40 @@ async function read() {
   }
 }
 
+// Pick a random voice in the dropdown that the user hasn't given any star
+// rating yet. Considers every option (custom clones, Gemini, full XTTS list)
+// so "unrated" reflects the whole catalog, not just what's currently in view.
+function pickUnratedOption() {
+  const opts = Array.from($voice.options).filter(o =>
+    o.dataset && o.dataset.engine && o.dataset.voice);
+  const unrated = opts.filter(o => {
+    const rec = (serverScores[o.dataset.engine] || {})[o.dataset.voice];
+    return !rec || !Number.isInteger(rec.stars);
+  });
+  if (!unrated.length) return null;
+  return unrated[Math.floor(Math.random() * unrated.length)];
+}
+
+document.getElementById('random').addEventListener('click', () => {
+  if (!$text.value.trim()) {
+    setStatus('paste text first', 'err');
+    return;
+  }
+  const pick = pickUnratedOption();
+  if (!pick) {
+    setStatus('every voice already rated — try clearing some stars', 'ok');
+    return;
+  }
+  $voice.value = pick.value;
+  setStatus(`trying ${pick.dataset.voice} (${pick.dataset.engine})…`);
+  read();
+});
+
 $read.addEventListener('click', read);
 $stop.addEventListener('click', () => {
   stopActiveStream();
   $out.pause(); $out.currentTime = 0;
+  $rating.hidden = true;
   setStatus('stopped');
 });
 
@@ -718,6 +1329,7 @@ document.getElementById('clear').addEventListener('click', () => {
   $text.value = '';
   $text.focus();
   // intentionally do not touch $voice — speaker selection persists
+  $rating.hidden = true;
   setStatus('cleared');
 });
 
@@ -735,6 +1347,8 @@ $speed.addEventListener('input', updateSpeedDisplay);
 updateSpeedDisplay();
 
 loadVoices();
+loadServerScores();
+refreshHistory();
 </script>
 </body>
 </html>
@@ -750,6 +1364,8 @@ SAMPLER_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e0e12">
 <title>XTTS voice sampler</title>
 <style>
   :root {
@@ -757,14 +1373,18 @@ SAMPLER_HTML = r"""<!doctype html>
     --accent: #7fff7f; --rule: #2a2a36; --bad: #ff7f7f;
   }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
-    font-family: -apple-system, "Segoe UI", system-ui, sans-serif; }
-  body { max-width: 760px; margin: 0 auto; padding: 24px; }
-  h1 { margin: 0 0 4px; font-size: 22px; font-weight: 600; }
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    -webkit-text-size-adjust: 100%; }
+  body { max-width: 760px; margin: 0 auto; padding: 24px;
+    padding-left: max(24px, env(safe-area-inset-left));
+    padding-right: max(24px, env(safe-area-inset-right)); }
+  h1 { margin: 0 0 4px; font-size: 22px; font-weight: 600; line-height: 1.25; }
   .sub { color: var(--dim); font-size: 13px; margin-bottom: 20px; }
   .stage { background: var(--panel); border: 1px solid var(--rule);
     border-radius: 14px; padding: 28px 24px; }
   .progress { color: var(--dim); font-size: 13px; }
-  .voice-name { font-size: 32px; font-weight: 600; margin: 12px 0 4px; }
+  .voice-name { font-size: 32px; font-weight: 600; margin: 12px 0 4px;
+    overflow-wrap: anywhere; }
   .voice-state { color: var(--dim); font-size: 13px; min-height: 18px; }
   .keys { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 22px; }
   .key { background: #0e0e12; border: 1px solid var(--rule); border-radius: 8px;
@@ -779,11 +1399,26 @@ SAMPLER_HTML = r"""<!doctype html>
     border-radius: 3px; vertical-align: middle; margin-left: 8px; }
   .done { color: var(--accent); font-size: 16px; margin-top: 16px; }
   button { background: var(--panel); color: var(--fg); border: 1px solid var(--rule);
-    border-radius: 8px; padding: 8px 14px; font: inherit; cursor: pointer; }
+    border-radius: 8px; padding: 8px 14px; font: inherit; cursor: pointer;
+    min-height: 40px; font-size: 16px; }
   button.primary { background: var(--accent); color: #0e1a0e; border: 0;
     font-weight: 600; }
   .err { color: var(--bad); font-size: 13px; }
   .start-overlay { text-align: center; padding: 30px 0; }
+
+  @media (max-width: 640px) {
+    body { padding: 14px;
+      padding-left: max(14px, env(safe-area-inset-left));
+      padding-right: max(14px, env(safe-area-inset-right)); }
+    h1 { font-size: 20px; }
+    .stage { padding: 20px 16px; border-radius: 12px; }
+    .voice-name { font-size: 26px; }
+    /* On phones the numeric keypad isn't visible, so swap key chips for
+       large tap targets — two rows of digit buttons. */
+    .keys { display: none; }
+    table { font-size: 13px; }
+    th, td { padding: 6px 4px; }
+  }
 </style>
 </head>
 <body>
@@ -982,19 +1617,13 @@ function loadVoiceList() {
   });
 }
 
-async function run() {
+async function run(ctx) {
   let voices;
   try {
     voices = await loadVoiceList();
   } catch (e) {
     $errMsg.textContent = 'failed to load voice list: ' + e.message;
     return;
-  }
-
-  const Ctx = window.AudioContext || window.webkitAudioContext;
-  const ctx = new Ctx();
-  if (ctx.state === 'suspended') {
-    try { await ctx.resume(); } catch (e) {}
   }
 
   const results = [];
@@ -1077,9 +1706,15 @@ function saveScores(results) {
 }
 
 document.getElementById('start').addEventListener('click', () => {
+  // Create + resume the AudioContext synchronously here so iOS Safari sees
+  // it as a user-gesture-initiated context. Awaiting before this point
+  // would leave it suspended and produce silent playback on iPhone.
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new Ctx();
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
   $overlay.style.display = 'none';
   $active.style.display = '';
-  run().catch(e => { $errMsg.textContent = 'aborted: ' + e.message; });
+  run(ctx).catch(e => { $errMsg.textContent = 'aborted: ' + e.message; });
 });
 </script>
 </body>
@@ -1111,9 +1746,68 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"0\r\n\r\n")
         self.wfile.flush()
 
+    def _is_authed(self) -> bool:
+        for part in (self.headers.get("Cookie", "") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == AUTH_COOKIE and v == SESSION_TOKEN:
+                return True
+        return False
+
+    def _send_login(self, error: str = "", status: int = 200) -> None:
+        body = LOGIN_HTML.replace("__ERROR__", error).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
+        if self.path == "/login":
+            self._send_login()
+            return
+        if not self._is_authed():
+            self._send_login(status=401)
+            return
         if self.path.startswith("/tts/stream"):
             self._handle_stream()
+            return
+        if self.path == "/history":
+            try:
+                body = json.dumps({"items": list_history()}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                self.send_error(500, f"{type(e).__name__}: {e}")
+            return
+        if self.path.startswith("/history/"):
+            # Only serve <id>.wav; reject anything else (incl. path traversal).
+            tail = self.path[len("/history/"):]
+            if not tail.endswith(".wav"):
+                self.send_error(404)
+                return
+            uid = tail[:-4]
+            if not _history_id_safe(uid):
+                self.send_error(400, "bad history id")
+                return
+            wav_path = HISTORY_DIR / f"{uid}.wav"
+            if not wav_path.is_file():
+                self.send_error(404, "history entry not found")
+                return
+            try:
+                data = wav_path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Accept-Ranges", "none")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception as e:
+                self.send_error(500, f"{type(e).__name__}: {e}")
             return
         if self.path == "/" or self.path.startswith("/index"):
             body = HTML.encode("utf-8")
@@ -1130,6 +1824,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if self.path == "/scores":
+            try:
+                body = json.dumps(load_scores()).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                self.send_error(500, f"{type(e).__name__}: {e}")
             return
         if self.path == "/voices":
             try:
@@ -1148,6 +1853,7 @@ class Handler(BaseHTTPRequestHandler):
                     "xtts": {
                         "recommended": xtts_recommended,
                         "all": xtts_all,
+                        "custom": list_custom_voices(),
                         "error": xtts_err,
                     },
                     "gemini": {
@@ -1183,6 +1889,7 @@ class Handler(BaseHTTPRequestHandler):
             text = (payload.get("text") or "").strip()
             speaker = (payload.get("speaker")
                        or (RECOMMENDED[0] if RECOMMENDED else ""))
+            speaker_wav_path = payload.get("_speaker_wav_path")
             language = payload.get("language") or "en"
             speed = max(0.5, min(2.0, float(payload.get("speed") or 1.0)))
             chunks = split_for_synth(text)
@@ -1206,12 +1913,28 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self._write_chunk(_wav_header_unknown_length(1, 2, sr))
 
+            # Buffer the raw PCM so we can persist a proper WAV to history
+            # after the stream completes successfully. A 5-minute clip at
+            # 24 kHz mono int16 is ~14 MB — safe to hold in memory.
+            pcm_parts: list[bytes] = []
+            stream_completed = False
             for idx, chunk in enumerate(chunks):
                 with _infer_lock:
                     t0 = time.time()
                     try:
-                        wav = tts.tts(text=chunk, speaker=speaker,
-                                      language=language, speed=speed)
+                        if speaker_wav_path:
+                            cache_dir = VOICES_DIR / ".cache"
+                            cache_dir.mkdir(parents=True, exist_ok=True)
+                            wav = tts.tts(
+                                text=chunk,
+                                speaker=Path(speaker_wav_path).stem,
+                                speaker_wav=speaker_wav_path,
+                                voice_dir=str(cache_dir),
+                                language=language, speed=speed,
+                            )
+                        else:
+                            wav = tts.tts(text=chunk, speaker=speaker,
+                                          language=language, speed=speed)
                     except Exception as e:
                         print(f"[xtts-stream] chunk {idx} failed: {e}",
                               file=sys.stderr)
@@ -1228,20 +1951,75 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"[xtts-stream] chunk {idx}: {len(chunk)} chars → "
                       f"{audio_ms:.0f}ms audio in {dt:.2f}s",
                       file=sys.stderr)
+                pcm_parts.append(pcm)
                 try:
                     self._write_chunk(pcm)
                 except (BrokenPipeError, ConnectionResetError):
                     return
             try:
                 self._end_chunked()
+                stream_completed = True
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+            if stream_completed and pcm_parts:
+                try:
+                    pcm_all = b"".join(pcm_parts)
+                    wav_bytes = _wav_wrap(pcm_all, n_channels=1,
+                                          sample_width=2, sample_rate=sr)
+                    duration_s = len(pcm_all) / (2 * sr)
+                    voice_label = (speaker if not speaker_wav_path
+                                   else f"clone:{Path(speaker_wav_path).stem}")
+                    save_history(
+                        text=text, engine="xtts", voice=voice_label,
+                        speed=speed, language=language,
+                        wav_bytes=wav_bytes, sample_rate=sr,
+                        duration_seconds=duration_s,
+                    )
+                except Exception as e:
+                    print(f"[xtts-stream] history save failed: "
+                          f"{type(e).__name__}: {e}", file=sys.stderr)
         except Exception as e:
             # Headers may already be sent — log and bail.
             print(f"[xtts-stream] aborted: {type(e).__name__}: {e}",
                   file=sys.stderr)
 
     def do_POST(self):
+        if self.path == "/auth":
+            n = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(n).decode("utf-8", errors="replace")
+            fields = parse_qs(body)
+            pk = (fields.get("passkey") or [""])[0]
+            if secrets.compare_digest(pk, PASSKEY):
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header(
+                    "Set-Cookie",
+                    f"{AUTH_COOKIE}={SESSION_TOKEN}; HttpOnly; SameSite=Lax; "
+                    f"Path=/; Max-Age=31536000",
+                )
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._send_login(error="invalid passkey", status=401)
+            return
+        if not self._is_authed():
+            self.send_error(401, "auth required")
+            return
+        if self.path == "/scores":
+            try:
+                n = int(self.headers.get("Content-Length", "0") or "0")
+                incoming = json.loads(self.rfile.read(n) or b"{}")
+                merged = merge_scores(incoming)
+                body = json.dumps(merged).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                self.send_error(500, f"{type(e).__name__}: {e}")
+            return
         if self.path == "/tts/prepare":
             try:
                 n = int(self.headers.get("Content-Length", "0") or "0")
@@ -1249,6 +2027,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not (payload.get("text") or "").strip():
                     self.send_error(400, "missing 'text'")
                     return
+                sw_name = (payload.get("speaker_wav") or "").strip()
+                if sw_name:
+                    sw_path = resolve_custom_voice(sw_name)
+                    if not sw_path:
+                        self.send_error(400, f"unknown custom voice: {sw_name}")
+                        return
+                    payload["_speaker_wav_path"] = str(sw_path)
                 uid = _stash_job(payload)
                 body = json.dumps({"id": uid,
                                    "url": f"/tts/stream?id={uid}"}).encode("utf-8")
@@ -1267,10 +2052,13 @@ class Handler(BaseHTTPRequestHandler):
                 text = (payload.get("text") or "").strip()
                 engine = payload.get("engine") or "xtts"
                 speaker = payload.get("speaker") or ""
+                sw_name = (payload.get("speaker_wav") or "").strip()
                 language = payload.get("language") or "en"
                 speed = float(payload.get("speed") or 1.0)
                 if not text:
                     self.send_error(400, "missing 'text'"); return
+                voice_label = speaker
+                hist_sr = 24000
                 if engine == "gemini":
                     if not gemini_available():
                         self.send_error(400, "Gemini backend unavailable "
@@ -1279,31 +2067,190 @@ class Handler(BaseHTTPRequestHandler):
                     # Gemini Flash TTS doesn't expose a rate param yet; the
                     # browser applies `speed` to <audio>.playbackRate instead.
                     wav = synth_gemini(text, voice=speaker or "Aoede")
+                    voice_label = speaker or "Aoede"
                 else:
-                    wav = synth_wav(text,
-                                    speaker=(speaker or (RECOMMENDED[0] if RECOMMENDED else None)),
-                                    language=language,
-                                    speed=speed)
+                    sw_path: str | None = None
+                    if sw_name:
+                        rp = resolve_custom_voice(sw_name)
+                        if not rp:
+                            self.send_error(400, f"unknown custom voice: {sw_name}")
+                            return
+                        sw_path = str(rp)
+                    wav = synth_wav(
+                        text,
+                        speaker=(speaker or (RECOMMENDED[0] if RECOMMENDED else None)),
+                        language=language,
+                        speed=speed,
+                        speaker_wav=sw_path,
+                    )
+                    if sw_path:
+                        voice_label = f"clone:{Path(sw_path).stem}"
+                    else:
+                        voice_label = (speaker
+                                       or (RECOMMENDED[0] if RECOMMENDED else ""))
+                    try:
+                        hist_sr = int(get_tts().synthesizer.output_sample_rate
+                                      or 24000)
+                    except Exception:
+                        hist_sr = 24000
                 self.send_response(200)
                 self.send_header("Content-Type", "audio/wav")
                 self.send_header("Content-Length", str(len(wav)))
                 self.end_headers()
                 self.wfile.write(wav)
+                try:
+                    # WAV header is 44 bytes; the rest is int16 mono PCM.
+                    pcm_len = max(0, len(wav) - 44)
+                    duration_s = pcm_len / (2 * hist_sr) if hist_sr else 0.0
+                    save_history(
+                        text=text, engine=engine, voice=voice_label,
+                        speed=speed, language=language,
+                        wav_bytes=wav, sample_rate=hist_sr,
+                        duration_seconds=duration_s,
+                    )
+                except Exception as e:
+                    print(f"[tts] history save failed: "
+                          f"{type(e).__name__}: {e}", file=sys.stderr)
             except Exception as e:
                 self.send_error(500, f"{type(e).__name__}: {e}")
             return
         self.send_error(404)
 
 
+def _pick_top_xtts_voice() -> str | None:
+    """Highest-rated XTTS voice in voice_scores.json, or None if no ratings."""
+    scores = (load_scores().get("xtts") or {})
+    rated = [(v, rec.get("score", 0)) for v, rec in scores.items()
+             if isinstance(rec, dict) and isinstance(rec.get("score"), (int, float))]
+    if not rated:
+        return None
+    rated.sort(key=lambda kv: kv[1], reverse=True)
+    return rated[0][0]
+
+
+def cmd_batch(argv: list[str]) -> int:
+    """Read a whole .txt file with one XTTS voice into a single .wav file.
+
+    Splits text into the same sentence-sized chunks the streaming path uses,
+    synthesizes each, and appends raw int16 PCM to a wave.Wave_write so the
+    output is one continuous file regardless of input length.
+    """
+    import argparse, wave
+    p = argparse.ArgumentParser(
+        prog="read_xtts.py batch",
+        description="Synthesize a whole text file to a single WAV (XTTS-v2).",
+    )
+    p.add_argument("-i", "--input", required=True, type=Path,
+                   help="Input text file (UTF-8).")
+    p.add_argument("-o", "--output", type=Path, default=None,
+                   help="Output WAV (default: <input stem>.wav alongside input).")
+    p.add_argument("-v", "--voice", default=None,
+                   help="XTTS speaker name. Default: highest-rated, else "
+                        f"{RECOMMENDED[0]!r}.")
+    p.add_argument("--language", default="en")
+    p.add_argument("--speed", type=float, default=1.0,
+                   help="XTTS rate multiplier, 0.5–2.0 (default 1.0).")
+    p.add_argument("--list-voices", action="store_true",
+                   help="Print rated + recommended voices and exit.")
+    args = p.parse_args(argv)
+
+    if args.list_voices:
+        scores = (load_scores().get("xtts") or {})
+        rated = sorted(((v, r.get("score", 0)) for v, r in scores.items()
+                        if isinstance(r, dict)), key=lambda kv: kv[1], reverse=True)
+        if rated:
+            print("rated voices (high → low):")
+            for v, s in rated:
+                print(f"  ★{s}  {v}")
+        else:
+            print("no rated voices yet — run the web UI's /sample to rate some.")
+        print("\nrecommended (curated):")
+        for v in RECOMMENDED:
+            print(f"  ☆   {v}")
+        return 0
+
+    if not args.input.exists():
+        print(f"error: input not found: {args.input}", file=sys.stderr)
+        return 2
+    text = args.input.read_text(encoding="utf-8")
+    chunks = split_for_synth(text)
+    if not chunks:
+        print("error: no synthesizable text in input", file=sys.stderr)
+        return 2
+
+    voice = (args.voice
+             or _pick_top_xtts_voice()
+             or (RECOMMENDED[0] if RECOMMENDED else None))
+    if not voice:
+        print("error: no voice specified and no recommended fallback",
+              file=sys.stderr)
+        return 2
+
+    out_path: Path = args.output or args.input.with_suffix(".wav")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tts = get_tts()
+    if voice not in _tts_speakers:
+        print(f"error: voice {voice!r} not in this XTTS model. Try "
+              f"--list-voices.", file=sys.stderr)
+        return 2
+    sr = int(tts.synthesizer.output_sample_rate or 24000)
+    speed = max(0.5, min(2.0, float(args.speed)))
+
+    import numpy as np
+    total_chars = sum(len(c) for c in chunks)
+    print(f"[batch] voice={voice!r} · {len(chunks)} chunks · "
+          f"{total_chars} chars · sr={sr} Hz · → {out_path}",
+          file=sys.stderr)
+
+    t_start = time.time()
+    total_audio_s = 0.0
+    with wave.open(str(out_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        for idx, chunk in enumerate(chunks, start=1):
+            t0 = time.time()
+            try:
+                wav = tts.tts(text=chunk, speaker=voice,
+                              language=args.language, speed=speed)
+            except Exception as e:
+                print(f"[batch] chunk {idx}/{len(chunks)} failed: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+                return 1
+            arr = np.clip(np.asarray(wav, dtype=np.float32), -1.0, 1.0)
+            pcm = (arr * 32767.0).astype(np.int16).tobytes()
+            wf.writeframes(pcm)
+            audio_s = len(pcm) / (2 * sr)
+            total_audio_s += audio_s
+            dt = max(time.time() - t0, 1e-6)
+            print(f"[batch] {idx:4d}/{len(chunks)}  "
+                  f"{len(chunk):4d} chars → {audio_s:5.1f}s audio "
+                  f"in {dt:4.1f}s ({audio_s/dt:4.1f}× rt)",
+                  file=sys.stderr)
+
+    elapsed = max(time.time() - t_start, 1e-6)
+    print(f"[batch] done: {total_audio_s/60:.1f} min audio in "
+          f"{elapsed/60:.1f} min ({total_audio_s/elapsed:.1f}× rt) → "
+          f"{out_path}", file=sys.stderr)
+    return 0
+
+
 def main() -> int:
+    # Subcommand split: `read_xtts.py batch ...` runs offline file→wav;
+    # everything else (including no args) runs the web server.
+    if len(sys.argv) > 1 and sys.argv[1] == "batch":
+        return cmd_batch(sys.argv[2:])
+
     import argparse, socket
     p = argparse.ArgumentParser(description="Local XTTS-v2 read-aloud web app.")
-    p.add_argument("--network", action="store_true",
-                   help="Bind to 0.0.0.0 (reachable on LAN).")
-    p.add_argument("--port", type=int, default=int(os.environ.get("READ_XTTS_PORT", "0")))
+    p.add_argument("--network", action=argparse.BooleanOptionalAction, default=True,
+                   help="Bind to 0.0.0.0 (default). Use --no-network for localhost only.")
+    p.add_argument("--port", type=int,
+                   default=int(os.environ.get("READ_XTTS_PORT", "8888")))
     p.add_argument("--no-browser", action="store_true")
-    p.add_argument("--preload", action="store_true",
-                   help="Load the XTTS-v2 model at startup (instead of on first request).")
+    p.add_argument("--preload", action=argparse.BooleanOptionalAction, default=True,
+                   help="Load the XTTS-v2 model at startup (default).")
     args = p.parse_args()
 
     bind = "0.0.0.0" if args.network else "127.0.0.1"

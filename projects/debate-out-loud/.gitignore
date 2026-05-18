@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+audio/
+*.wav
+*.mp3
+voice_scores.json
+voices/.cache/
+history/
