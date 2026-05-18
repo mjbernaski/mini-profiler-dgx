@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
@@ -179,10 +180,35 @@ def merge_scores(incoming: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 _HIST_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}_[0-9a-f]{8}$")
+HISTORY_PREVIEW_CHARS = 200
+
+# In-memory cache of history sidecars, newest-first. Populated lazily on
+# first use; mutated in lockstep with disk by save_history / prune. Avoids
+# globbing + 100 file opens on every GET /history (which fires after every
+# generation via refreshHistory()).
+_history_index: list[dict] = []
+_history_loaded = False
 
 
 def _history_id_safe(uid: str) -> bool:
     return bool(_HIST_ID_RE.match(uid or ""))
+
+
+def _ensure_history_loaded_locked() -> None:
+    """Populate _history_index from disk if not already. Caller holds lock."""
+    global _history_loaded
+    if _history_loaded:
+        return
+    _history_index.clear()
+    if HISTORY_DIR.is_dir():
+        paths = sorted(HISTORY_DIR.glob("*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)[:HISTORY_MAX]
+        for jp in paths:
+            try:
+                _history_index.append(json.loads(jp.read_text()))
+            except Exception:
+                continue
+    _history_loaded = True
 
 
 def save_history(*, text: str, engine: str, voice: str, speed: float,
@@ -208,34 +234,58 @@ def save_history(*, text: str, engine: str, voice: str, speed: float,
     with _history_lock:
         (HISTORY_DIR / f"{base}.wav").write_bytes(wav_bytes)
         (HISTORY_DIR / f"{base}.json").write_text(json.dumps(meta))
+        _ensure_history_loaded_locked()
+        _history_index.insert(0, meta)
         _prune_history_locked()
     return base
 
 
 def _prune_history_locked() -> None:
-    """Trim history/ to HISTORY_MAX entries by oldest mtime. Caller holds lock."""
-    jsons = sorted(HISTORY_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
-    while len(jsons) > HISTORY_MAX:
-        oldest = jsons.pop(0)
-        for p in (oldest, oldest.with_suffix(".wav")):
+    """Trim disk + in-memory to HISTORY_MAX entries. Caller holds lock.
+
+    Assumes _history_index is already populated and ordered newest-first.
+    Trims the in-memory tail, deletes matching disk files. We don't re-scan
+    the directory — anything not in the index isn't our problem.
+    """
+    while len(_history_index) > HISTORY_MAX:
+        old = _history_index.pop()
+        old_id = (old.get("id") or "")
+        if not _history_id_safe(old_id):
+            continue
+        for p in (HISTORY_DIR / f"{old_id}.wav",
+                  HISTORY_DIR / f"{old_id}.json"):
             try:
                 p.unlink()
             except FileNotFoundError:
                 pass
 
 
+def _entry_for_list(meta: dict) -> dict:
+    """Slim copy of a history entry for /history responses.
+
+    Strips the full text body (can be many KB) and substitutes a fixed-size
+    preview so the listing payload stays small regardless of how long the
+    underlying generations were. Full text remains on disk in the sidecar.
+    """
+    text = meta.get("text") or ""
+    if len(text) > HISTORY_PREVIEW_CHARS:
+        preview = text[:HISTORY_PREVIEW_CHARS] + "…"
+    else:
+        preview = text
+    out = {k: v for k, v in meta.items() if k != "text"}
+    out["text_preview"] = preview
+    return out
+
+
 def list_history() -> list[dict]:
-    """Return history metadata newest-first, capped at HISTORY_MAX entries."""
-    if not HISTORY_DIR.is_dir():
-        return []
-    items: list[dict] = []
-    for jp in sorted(HISTORY_DIR.glob("*.json"),
-                     key=lambda p: p.stat().st_mtime, reverse=True)[:HISTORY_MAX]:
-        try:
-            items.append(json.loads(jp.read_text()))
-        except Exception:
-            continue
-    return items
+    """Return history listing newest-first, capped at HISTORY_MAX entries.
+
+    Each entry has `text_preview` instead of `text`; the full text stays in
+    the on-disk sidecar.
+    """
+    with _history_lock:
+        _ensure_history_loaded_locked()
+        return [_entry_for_list(m) for m in _history_index]
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +565,9 @@ def _gemini_synth_chunk(client, types_mod, text: str, voice: str) -> bytes:
     raise RuntimeError("Gemini response had no inline audio data")
 
 
+GEMINI_PARALLEL_WORKERS = int(os.environ.get("READ_XTTS_GEMINI_WORKERS", "4"))
+
+
 def synth_gemini(text: str, voice: str = "Aoede") -> bytes:
     """Synthesize via Gemini TTS, returning a single WAV (24 kHz mono int16).
 
@@ -522,6 +575,10 @@ def synth_gemini(text: str, voice: str = "Aoede") -> bytes:
     short input. Single-shot calls hit Gemini's per-request audio-output
     budget on long text — chunking dodges both the truncation and the
     documented "quality drifts after a few minutes" caveat.
+
+    Chunks are fanned out concurrently up to GEMINI_PARALLEL_WORKERS, then
+    reassembled in submission order so audio plays in the right sequence.
+    Fail-fast: first chunk to error aborts the rest.
     """
     from google import genai
     from google.genai import types
@@ -529,13 +586,11 @@ def synth_gemini(text: str, voice: str = "Aoede") -> bytes:
     if not chunks:
         raise RuntimeError("empty text")
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    pcm_parts: list[bytes] = []
-    for idx, chunk in enumerate(chunks, start=1):
+    total = len(chunks)
+
+    def synth_one(idx: int, chunk: str) -> bytes:
         t0 = time.time()
         last_err: Exception | None = None
-        # One retry on transient failure (network blip, transient 5xx). The
-        # Gemini SDK raises a single Exception subclass for everything; we
-        # don't try to discriminate — just don't loop forever.
         for attempt in (1, 2):
             try:
                 pcm = _gemini_synth_chunk(client, types, chunk, voice)
@@ -544,20 +599,44 @@ def synth_gemini(text: str, voice: str = "Aoede") -> bytes:
             except Exception as e:
                 last_err = e
                 if attempt == 1:
-                    print(f"[gemini-tts] chunk {idx}/{len(chunks)} attempt 1 "
+                    print(f"[gemini-tts] chunk {idx}/{total} attempt 1 "
                           f"failed ({type(e).__name__}: {e}); retrying…",
                           file=sys.stderr)
                     time.sleep(1.0)
         if last_err is not None:
             raise RuntimeError(
-                f"Gemini chunk {idx}/{len(chunks)} failed after retry: "
+                f"Gemini chunk {idx}/{total} failed after retry: "
                 f"{type(last_err).__name__}: {last_err}"
             ) from last_err
         dt = time.time() - t0
         audio_ms = (len(pcm) / (2 * 24000)) * 1000.0
-        print(f"[gemini-tts] chunk {idx}/{len(chunks)}: {len(chunk)} chars → "
+        print(f"[gemini-tts] chunk {idx}/{total}: {len(chunk)} chars → "
               f"{audio_ms:.0f}ms audio in {dt:.2f}s", file=sys.stderr)
-        pcm_parts.append(pcm)
+        return pcm
+
+    workers = max(1, min(GEMINI_PARALLEL_WORKERS, total))
+    pcm_parts: list[bytes | None] = [None] * total
+    if workers == 1:
+        for i, c in enumerate(chunks):
+            pcm_parts[i] = synth_one(i + 1, c)
+    else:
+        t_pool0 = time.time()
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="gemini-tts") as ex:
+            futures = {ex.submit(synth_one, i + 1, c): i
+                       for i, c in enumerate(chunks)}
+            try:
+                for fut in as_completed(futures):
+                    pcm_parts[futures[fut]] = fut.result()
+            except Exception:
+                # Cancel anything still queued; in-flight calls will finish
+                # on their own as the executor exits.
+                for f in futures:
+                    f.cancel()
+                raise
+        print(f"[gemini-tts] {total} chunks via {workers} workers in "
+              f"{time.time() - t_pool0:.2f}s", file=sys.stderr)
+
     return _wav_wrap(b"".join(pcm_parts), n_channels=1, sample_width=2,
                      sample_rate=24000)
 
@@ -777,17 +856,24 @@ function loadScores(engine) {
   } catch (e) { return {}; }
 }
 
-// Sort an engine's voices: rated (high → low), then recommended (XTTS only),
-// then original list order. Returns augmented items with .score / .rec.
-function sortVoices(items, scores, recSet) {
+// Sort an engine's voices: star-rated highest (5★ → 1★), then sampler-rated
+// (audition score high → low), then recommended (XTTS only), then original
+// list order. Stars come from serverScores (server-authoritative, 1-5);
+// sampler `score` comes from localStorage / sampler page (1-9).
+function sortVoices(items, scores, stars, recSet) {
   const augmented = items.map((it, idx) => ({
     ...it,
     score: (scores[it.name] && typeof scores[it.name].score === 'number')
               ? scores[it.name].score : null,
+    stars: (stars && stars[it.name] && Number.isInteger(stars[it.name].stars))
+              ? stars[it.name].stars : null,
     rec: recSet ? recSet.has(it.name) : false,
     origIdx: idx,
   }));
   augmented.sort((a, b) => {
+    const sta = a.stars == null ? -Infinity : a.stars;
+    const stb = b.stars == null ? -Infinity : b.stars;
+    if (stb !== sta) return stb - sta;
     const sa = a.score == null ? -Infinity : a.score;
     const sb = b.score == null ? -Infinity : b.score;
     if (sb !== sa) return sb - sa;
@@ -798,6 +884,12 @@ function sortVoices(items, scores, recSet) {
 }
 
 function labelFor(item) {
+  // Stars win over sampler score so post-generation ratings (the real verdict)
+  // take precedence in the label.
+  if (item.stars != null) {
+    return `${item.label} · ` + '★'.repeat(item.stars)
+                              + '☆'.repeat(5 - item.stars);
+  }
   if (item.score != null) return `${item.label} · ★${item.score}`;
   if (item.rec)           return `${item.label} · ☆`;
   return item.label;
@@ -835,7 +927,20 @@ async function loadVoices() {
 
     const xttsScores = loadScores('xtts');
     const geminiScores = loadScores('gemini');
+    const xttsStars = serverScores.xtts || {};
+    const geminiStars = serverScores.gemini || {};
     let topXtts = null, topGemini = null, topCustom = null;
+
+    // Stamp baseLabel + rec onto each option so we can recompute the label
+    // (e.g. after a star rating change) without rebuilding the dropdown.
+    function appendOpt(group, engine, it, extras) {
+      const o = makeOption(engine, it.name, labelFor(it));
+      o.dataset.baseLabel = it.label;
+      o.dataset.rec = it.rec ? '1' : '0';
+      if (extras) Object.assign(o.dataset, extras);
+      group.appendChild(o);
+      return o;
+    }
 
     // Custom cloned voices first (most prominent). Score namespace is shared
     // with XTTS so a rated clone competes against the built-ins.
@@ -845,11 +950,9 @@ async function loadVoices() {
       const items = data.xtts.custom.map(c => ({
         name: c.name, label: c.name, file: c.file,
       }));
-      const sorted = sortVoices(items, xttsScores, null);
+      const sorted = sortVoices(items, xttsScores, xttsStars, null);
       for (const it of sorted) {
-        const o = makeOption('xtts', it.name, labelFor(it));
-        o.dataset.speakerWav = it.file;
-        og.appendChild(o);
+        appendOpt(og, 'xtts', it, { speakerWav: it.file });
       }
       $voice.appendChild(og);
       topCustom = sorted[0] || null;
@@ -861,9 +964,9 @@ async function loadVoices() {
       const items = data.gemini.voices.map(v => ({
         name: v.name, label: `${v.name} · ${v.style}`,
       }));
-      const sorted = sortVoices(items, geminiScores, null);
+      const sorted = sortVoices(items, geminiScores, geminiStars, null);
       for (const it of sorted) {
-        og.appendChild(makeOption('gemini', it.name, labelFor(it)));
+        appendOpt(og, 'gemini', it, null);
       }
       $voice.appendChild(og);
       topGemini = sorted[0] || null;
@@ -874,9 +977,9 @@ async function loadVoices() {
       og.label = 'XTTS-v2 local';
       const items = data.xtts.all.map(n => ({ name: n, label: n }));
       const recSet = new Set(data.xtts.recommended || []);
-      const sorted = sortVoices(items, xttsScores, recSet);
+      const sorted = sortVoices(items, xttsScores, xttsStars, recSet);
       for (const it of sorted) {
-        og.appendChild(makeOption('xtts', it.name, labelFor(it)));
+        appendOpt(og, 'xtts', it, null);
       }
       $voice.appendChild(og);
       topXtts = sorted[0] || null;
@@ -894,6 +997,9 @@ async function loadVoices() {
     if (topGemini) candidates.push({ kind: 'gemini', engine: 'gemini', it: topGemini });
     const kindRank = { custom: 0, xtts: 1, gemini: 2 };
     candidates.sort((a, b) => {
+      const sta = a.it.stars == null ? -Infinity : a.it.stars;
+      const stb = b.it.stars == null ? -Infinity : b.it.stars;
+      if (stb !== sta) return stb - sta;
       const sa = a.it.score == null ? -Infinity : a.it.score;
       const sb = b.it.score == null ? -Infinity : b.it.score;
       if (sb !== sa) return sb - sa;
@@ -1111,6 +1217,7 @@ async function postRating(engine, voice, stars) {
   // Update local cache immediately for snappy UI; server merge will agree.
   const slot = (serverScores[engine] = serverScores[engine] || {});
   slot[voice] = Object.assign({}, slot[voice] || {}, { stars, stars_t });
+  refreshVoiceLabel(engine, voice);
   try {
     await fetch('/scores', {
       method: 'POST',
@@ -1119,6 +1226,26 @@ async function postRating(engine, voice, stars) {
     });
   } catch (e) {
     setStatus('rating save failed: ' + e.message, 'err');
+  }
+}
+
+// Re-render one option's label in place using current serverScores + the
+// stamped baseLabel/rec. We deliberately do NOT re-sort the dropdown — that
+// would jump items around mid-session and surprise the user. Sort is fresh
+// on the next page load.
+function refreshVoiceLabel(engine, voice) {
+  for (const o of $voice.options) {
+    if (o.dataset.engine !== engine || o.dataset.voice !== voice) continue;
+    const rec = (serverScores[engine] || {})[voice] || {};
+    const localRec = (loadScores(engine) || {})[voice] || {};
+    o.textContent = labelFor({
+      label: o.dataset.baseLabel || o.textContent,
+      stars: Number.isInteger(rec.stars) ? rec.stars : null,
+      score: typeof localRec.score === 'number' ? localRec.score
+             : (typeof rec.score === 'number' ? rec.score : null),
+      rec: o.dataset.rec === '1',
+    });
+    return;
   }
 }
 
@@ -1159,7 +1286,7 @@ function playHistory(item) {
   $out.play().catch(e => setStatus('play failed: ' + e.message, 'err'));
   lastAudio = null;       // history entry isn't the "last generated" blob
   enableSaveButton(false);
-  setStatus('history · ' + previewText(item.text, 60), 'ok');
+  setStatus('history · ' + previewText(item.text_preview || '', 60), 'ok');
 }
 
 async function refreshHistory() {
@@ -1195,7 +1322,9 @@ async function refreshHistory() {
       l1.textContent = `${fmtHistTime(it.created_at)} · ${it.engine} · ${it.voice || '—'} · ${dur}`;
       const l2 = document.createElement('div');
       l2.className = 'hist-line2';
-      l2.textContent = previewText(it.text);
+      // Server already trimmed to HISTORY_PREVIEW_CHARS; previewText caps
+      // further at the UI's 2-line clamp width.
+      l2.textContent = previewText(it.text_preview || '');
       meta.appendChild(l1); meta.appendChild(l2);
 
       const dl = document.createElement('a');
@@ -1346,8 +1475,10 @@ function updateSpeedDisplay() {
 $speed.addEventListener('input', updateSpeedDisplay);
 updateSpeedDisplay();
 
-loadVoices();
-loadServerScores();
+// Serial: serverScores must arrive before loadVoices so the dropdown sorts
+// and labels by star rating. syncScoresToServer (called from inside
+// loadVoices) handles its own async work fire-and-forget.
+loadServerScores().then(loadVoices);
 refreshHistory();
 </script>
 </body>
