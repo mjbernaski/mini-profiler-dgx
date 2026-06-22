@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Build a self-running slideshow of the Greece photos, duplicates removed.
+
+Each slide shows the high-resolution photo on the left and its caption on the
+right, then plays the narrated WAV; when the audio ends the show advances to
+the next photo on its own. (Browsers block autoplay until a user gesture, so
+the page opens with a Start button — after that one click, narration and
+advancing run hands-free.)
+
+Pipeline reuse:
+  * photos.py            -> the canonical photo set + trip order + group labels
+  * captions/<stem>.txt  -> caption text (built by caption_greece.py)
+  * captions/thumbs/     -> existing web thumbnails, hashed for dedup
+  * captions/audio/      -> narration WAVs (built by narrate_captions.py)
+
+Duplicate removal: a difference-hash (dHash) is computed from each thumbnail;
+photos whose hash is within --max-distance bits of one already kept are dropped
+(first occurrence in trip order wins). DSC_0270/DSC_0270_1 etc. fall out here.
+
+High-res display images are rendered from the raw photos into
+captions/slideshow_img/ (longest edge --img-max, default 2200px) only for the
+surviving slides. Re-runnable: existing display images are skipped.
+
+Output: captions/slideshow.html — self-contained, served as-is by serve.py.
+
+  python3 build_slideshow.py                 # uses repo's PIL
+"""
+from __future__ import annotations
+
+import argparse
+import html
+import json
+from pathlib import Path
+
+from PIL import Image, ImageOps
+
+import photos as photo_src
+
+OUT_DIR = Path("/home/mjbernaski/projects/omni-play/captions")
+THUMB_DIR = OUT_DIR / "thumbs"
+AUDIO_DIR = OUT_DIR / "audio"
+IMG_DIR = OUT_DIR / "slideshow_img"          # high-res display images
+MODEL_NAME = "Nemotron-3-Nano-Omni"          # caption author, shown in footer
+
+
+# ---------------------------------------------------------------- dedup -----
+def dhash(path: Path, size: int = 8) -> int:
+    """64-bit difference hash: compares each pixel to its right neighbour on a
+    (size+1)x size grayscale downscale. Robust to re-encoding/resizing, so it
+    catches genuine duplicates without flagging merely similar burst shots."""
+    with Image.open(path) as im:
+        im = im.convert("L").resize((size + 1, size), Image.LANCZOS)
+        px = list(im.getdata())
+    bits = 0
+    for row in range(size):
+        base = row * (size + 1)
+        for col in range(size):
+            bits = (bits << 1) | int(px[base + col] < px[base + col + 1])
+    return bits
+
+
+def is_dupe(h: int, kept: list[int], max_distance: int) -> bool:
+    return any((h ^ k).bit_count() <= max_distance for k in kept)
+
+
+# ------------------------------------------------------------ hi-res img ----
+def make_display(src: Path, dst: Path, img_max: int) -> None:
+    """Render a high-res display JPEG, skipping if already present. Writes to a
+    .part file and renames so an interrupt never leaves a truncated image."""
+    if dst.exists():
+        return
+    tmp = dst.with_suffix(dst.suffix + ".part")
+    with Image.open(src) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        im.thumbnail((img_max, img_max), Image.LANCZOS)
+        im.save(tmp, format="JPEG", quality=88)
+    tmp.replace(dst)
+
+
+# --------------------------------------------------------------- page -------
+PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Greece 2026 — Slideshow</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  html, body {{ height: 100%; margin: 0; }}
+  body {{ background: #0e0f13; color: #e6e7ea; overflow: hidden;
+         font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
+  #stage {{ display: flex; height: 100vh; }}
+  #imgwrap {{ flex: 0 0 70%; min-width: 0; background: #000;
+             display: flex; align-items: center; justify-content: center; }}
+  #imgwrap img {{ max-width: 100%; max-height: 100vh; display: block; }}
+  #side {{ flex: 0 0 30%; display: flex; flex-direction: column;
+          border-left: 1px solid #23252c; background: #15171d; }}
+  #side .group {{ padding: 26px 30px 0; font-size: 12px; letter-spacing: .14em;
+                 text-transform: uppercase; color: #8b93a3; }}
+  #side .num {{ padding: 6px 30px 0; font-size: 12px; letter-spacing: .12em;
+               text-transform: uppercase; color: #6b717c; }}
+  #caption {{ flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 18px 30px 24px;
+             font-size: 19px; line-height: 1.7; color: #d6d9df; }}
+  #controls {{ flex: 0 0 auto; display: flex; align-items: center; gap: 14px;
+              padding: 16px 30px 22px; border-top: 1px solid #23252c; }}
+  #controls button {{ appearance: none; border: 1px solid #2f3340; background: #1b1e26;
+              color: #cdd2dc; height: 40px; min-width: 44px; padding: 0 14px;
+              border-radius: 9px; font-size: 16px; cursor: pointer;
+              transition: background .15s, border-color .15s; }}
+  #controls button:hover {{ background: #262a35; border-color: #3a4150; }}
+  #bar {{ position: fixed; left: 0; bottom: 0; height: 3px; background: #2d6cdf;
+         width: 0; transition: width .2s linear; z-index: 5; }}
+  /* start overlay */
+  #start {{ position: fixed; inset: 0; background: rgba(8,9,12,.94); z-index: 9;
+           display: flex; flex-direction: column; align-items: center; justify-content: center;
+           gap: 22px; text-align: center; padding: 24px; }}
+  #start h1 {{ margin: 0; font-size: 34px; font-weight: 650; }}
+  #start p {{ margin: 0; color: #9aa0ab; }}
+  #start button {{ appearance: none; border: none; background: #2d6cdf; color: #fff;
+           font-size: 18px; padding: 14px 34px; border-radius: 11px; cursor: pointer; }}
+  #start button:hover {{ background: #3b78ea; }}
+  @media (max-width: 760px) {{
+    #stage {{ flex-direction: column; }}
+    #side {{ flex: 1 1 auto; max-width: none; border-left: none; border-top: 1px solid #23252c; }}
+    #imgwrap {{ flex: 0 0 46vh; }}
+    #imgwrap img {{ max-height: 46vh; }}
+  }}
+</style>
+</head><body>
+<div id="stage">
+  <div id="imgwrap"><img id="photo" alt=""></div>
+  <div id="side">
+    <div class="group" id="group"></div>
+    <div class="num" id="num"></div>
+    <div id="caption"></div>
+    <div id="controls">
+      <button id="prev" title="Previous (←)">⏮</button>
+      <button id="toggle" title="Play / pause (space)">⏸</button>
+      <button id="next" title="Next (→)">⏭</button>
+      <button id="mute" title="Mute narration">🔊</button>
+    </div>
+  </div>
+</div>
+<div id="bar"></div>
+<div id="start">
+  <h1>Greece 2026</h1>
+  <p>{n} photographs · captions &amp; narration by {model}<br>
+     Plays each photo's narration, then advances on its own.</p>
+  <button id="go">▶ Start slideshow</button>
+</div>
+<script>
+const SLIDES = {data};
+const ADVANCE_NO_AUDIO_MS = 9000;   // dwell time for slides with no narration
+const GAP_MS = 700;                 // pause between slides
+
+const photo = document.getElementById('photo');
+const group = document.getElementById('group');
+const num   = document.getElementById('num');
+const cap   = document.getElementById('caption');
+const bar   = document.getElementById('bar');
+const toggle= document.getElementById('toggle');
+const mute  = document.getElementById('mute');
+const audio = new Audio();
+let i = 0, paused = false, timer = null;
+
+function clearTimer() {{ if (timer) {{ clearTimeout(timer); timer = null; }} }}
+
+function schedule(ms) {{
+  clearTimer();
+  if (paused) return;
+  timer = setTimeout(() => advance(1), ms);
+}}
+
+function render() {{
+  const s = SLIDES[i];
+  photo.src = s.img;
+  photo.alt = s.stem;
+  group.textContent = s.group;
+  num.textContent = (i + 1) + ' / ' + SLIDES.length;
+  cap.textContent = s.caption;
+  cap.scrollTop = 0;
+  bar.style.width = ((i + 1) / SLIDES.length * 100) + '%';
+}}
+
+function play() {{
+  const s = SLIDES[i];
+  audio.pause();
+  clearTimer();
+  if (s.audio && !paused) {{
+    audio.src = s.audio;
+    audio.muted = mute.dataset.muted === '1';
+    audio.play().catch(() => schedule(ADVANCE_NO_AUDIO_MS));
+  }} else if (!s.audio) {{
+    schedule(ADVANCE_NO_AUDIO_MS);
+  }}
+}}
+
+function show(n) {{ i = (n + SLIDES.length) % SLIDES.length; render(); play(); }}
+function advance(d) {{ clearTimer(); audio.pause(); setTimeout(() => show(i + d), GAP_MS); }}
+
+// Auto-scroll a long caption in time with the narration so it all gets read.
+audio.addEventListener('timeupdate', () => {{
+  const over = cap.scrollHeight - cap.clientHeight;
+  if (over <= 0 || !audio.duration) return;
+  cap.scrollTop = (audio.currentTime / audio.duration) * over;
+}});
+
+audio.addEventListener('ended', () => schedule(GAP_MS));
+
+function setPaused(p) {{
+  paused = p;
+  toggle.textContent = p ? '▶' : '⏸';
+  if (p) {{ audio.pause(); clearTimer(); }}
+  else {{ play(); }}
+}}
+
+document.getElementById('prev').onclick = () => advance(-1);
+document.getElementById('next').onclick = () => advance(1);
+toggle.onclick = () => setPaused(!paused);
+mute.onclick = () => {{
+  const m = mute.dataset.muted === '1' ? '0' : '1';
+  mute.dataset.muted = m;
+  mute.textContent = m === '1' ? '🔇' : '🔊';
+  audio.muted = m === '1';
+}};
+document.addEventListener('keydown', e => {{
+  if (e.key === 'ArrowRight') advance(1);
+  else if (e.key === 'ArrowLeft') advance(-1);
+  else if (e.key === ' ') {{ e.preventDefault(); setPaused(!paused); }}
+}});
+
+document.getElementById('go').onclick = () => {{
+  document.getElementById('start').remove();
+  show(0);
+}};
+</script>
+</body></html>
+"""
+
+
+def build(max_distance: int, img_max: int) -> None:
+    IMG_DIR.mkdir(parents=True, exist_ok=True)
+    photos = photo_src.list_photos()
+
+    slides, kept_hashes = [], []
+    dropped = no_cap = no_thumb = 0
+    for rec in photos:
+        stem = rec["stem"]
+        thumb = THUMB_DIR / (stem + ".jpg")
+        cap_file = OUT_DIR / (stem + ".txt")
+        if not thumb.exists():
+            no_thumb += 1
+            continue
+        text = cap_file.read_text().strip() if cap_file.exists() else ""
+        if not text:
+            no_cap += 1
+            continue
+        h = dhash(thumb)
+        if is_dupe(h, kept_hashes, max_distance):
+            dropped += 1
+            continue
+        kept_hashes.append(h)
+        slides.append({"stem": stem, "group": rec["group"],
+                       "caption": text, "raw": rec["path"]})
+
+    print(f"{len(photos)} photos · {dropped} duplicates removed · "
+          f"{no_cap} without caption · {no_thumb} without thumbnail")
+    print(f"rendering {len(slides)} high-res images (≤{img_max}px) → {IMG_DIR}")
+
+    data = []
+    for n, s in enumerate(slides, 1):
+        dst = IMG_DIR / (s["stem"] + ".jpg")
+        try:
+            make_display(s["raw"], dst, img_max)
+        except Exception as e:
+            print(f"  ! {s['stem']}: {type(e).__name__}: {e}")
+            continue
+        wav = AUDIO_DIR / (s["stem"] + ".wav")
+        data.append({
+            "stem": s["stem"],
+            "group": s["group"],
+            "caption": s["caption"],
+            "img": f"slideshow_img/{dst.name}",
+            "audio": f"audio/{wav.name}" if wav.exists() else None,
+        })
+        if n % 25 == 0:
+            print(f"  {n}/{len(slides)}")
+
+    out = OUT_DIR / "slideshow.html"
+    out.write_text(PAGE.format(n=len(data), model=html.escape(MODEL_NAME),
+                               data=json.dumps(data, ensure_ascii=False)))
+    with_audio = sum(1 for d in data if d["audio"])
+    print(f"\nwrote {out}")
+    print(f"slides: {len(data)} ({with_audio} with narration)")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--max-distance", type=int, default=5,
+                    help="dHash Hamming distance under which photos count as "
+                         "duplicates (default 5; 0 = byte-exact only).")
+    ap.add_argument("--img-max", type=int, default=2200,
+                    help="longest edge of the high-res display image (px).")
+    args = ap.parse_args()
+    build(args.max_distance, args.img_max)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

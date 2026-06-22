@@ -18,3 +18,11 @@
 !projects/mini-profiler/mini_profiler_cli.py
 !projects/debate-out-loud/
 !projects/debate-out-loud/read_xtts.py
+!projects/omni-play/
+!projects/omni-play/build_gallery.py
+!projects/omni-play/build_slideshow.py
+!projects/omni-play/caption_greece.py
+!projects/omni-play/narrate_captions.py
+!projects/omni-play/photos.py
+!projects/omni-play/serve.py
+!projects/omni-play/status.py
