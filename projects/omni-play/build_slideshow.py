@@ -119,6 +119,29 @@ PAGE = """<!doctype html>
   #start button {{ appearance: none; border: none; background: #2d6cdf; color: #fff;
            font-size: 18px; padding: 14px 34px; border-radius: 11px; cursor: pointer; }}
   #start button:hover {{ background: #3b78ea; }}
+  #start a {{ color: #9aa0ab; text-decoration: underline; cursor: pointer; font-size: 15px; }}
+  #start a:hover {{ color: #cdd2dc; }}
+  /* index overlay */
+  #index-overlay {{ position: fixed; inset: 0; background: rgba(8,9,12,.97); z-index: 12;
+                   display: none; flex-direction: column; }}
+  #index-overlay.open {{ display: flex; }}
+  #index-head {{ flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+                padding: 16px 26px; border-bottom: 1px solid #23252c; }}
+  #index-head h2 {{ margin: 0; font-size: 18px; font-weight: 600; }}
+  #index-head button {{ appearance: none; border: 1px solid #2f3340; background: #1b1e26;
+                color: #cdd2dc; height: 38px; padding: 0 16px; border-radius: 9px;
+                font-size: 15px; cursor: pointer; }}
+  #index-head button:hover {{ background: #262a35; border-color: #3a4150; }}
+  #grid {{ flex: 1 1 auto; overflow-y: auto; padding: 20px 26px 40px;
+          display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }}
+  #grid figure {{ margin: 0; cursor: pointer; border: 2px solid transparent; border-radius: 10px;
+                 overflow: hidden; background: #15171d; transition: border-color .15s, transform .1s; }}
+  #grid figure:hover {{ border-color: #2d6cdf; transform: translateY(-2px); }}
+  #grid figure.active {{ border-color: #2d6cdf; }}
+  #grid img {{ width: 100%; aspect-ratio: 4/3; object-fit: cover; display: block; background: #000; }}
+  #grid figcaption {{ padding: 6px 9px 8px; font-size: 11px; color: #9aa0ab;
+                     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  #grid figcaption b {{ color: #cdd2dc; font-weight: 600; }}
   @media (max-width: 760px) {{
     #stage {{ flex-direction: column; }}
     #side {{ flex: 1 1 auto; max-width: none; border-left: none; border-top: 1px solid #23252c; }}
@@ -137,16 +160,25 @@ PAGE = """<!doctype html>
       <button id="prev" title="Previous (←)">⏮</button>
       <button id="toggle" title="Play / pause (space)">⏸</button>
       <button id="next" title="Next (→)">⏭</button>
+      <button id="index" title="Index — jump to a photo (i)">☰</button>
       <button id="mute" title="Mute narration">🔊</button>
     </div>
   </div>
 </div>
 <div id="bar"></div>
+<div id="index-overlay">
+  <div id="index-head">
+    <h2>All photos</h2>
+    <button id="index-close" title="Close (Esc)">✕ Close</button>
+  </div>
+  <div id="grid"></div>
+</div>
 <div id="start">
   <h1>Greece 2026</h1>
   <p>{n} photographs · captions &amp; narration by {model}<br>
      Plays each photo's narration, then advances on its own.</p>
   <button id="go">▶ Start slideshow</button>
+  <a id="browse">… or pick a photo to start from</a>
 </div>
 <script>
 const SLIDES = {data};
@@ -180,6 +212,7 @@ function render() {{
   cap.textContent = s.caption;
   cap.scrollTop = 0;
   bar.style.width = ((i + 1) / SLIDES.length * 100) + '%';
+  if (gridBuilt) markActive();
 }}
 
 function play() {{
@@ -233,6 +266,59 @@ document.getElementById('go').onclick = () => {{
   document.getElementById('start').remove();
   show(0);
 }};
+
+// ---- index overlay: jump to / start from any photo --------------------------
+const grid = document.getElementById('grid');
+const indexOverlay = document.getElementById('index-overlay');
+let gridBuilt = false;
+
+function buildGrid() {{
+  if (gridBuilt) return;
+  gridBuilt = true;
+  SLIDES.forEach((s, n) => {{
+    const fig = document.createElement('figure');
+    const im = document.createElement('img');
+    im.loading = 'lazy'; im.src = s.thumb; im.alt = '';
+    const fc = document.createElement('figcaption');
+    const b = document.createElement('b'); b.textContent = n + 1;
+    fc.appendChild(b);
+    fc.appendChild(document.createTextNode(' · ' + s.group));
+    fig.appendChild(im); fig.appendChild(fc);
+    fig.onclick = () => jumpTo(n);
+    grid.appendChild(fig);
+  }});
+}}
+
+function markActive() {{
+  for (let n = 0; n < grid.children.length; n++)
+    grid.children[n].classList.toggle('active', n === i);
+}}
+
+function openIndex() {{
+  buildGrid();
+  markActive();
+  indexOverlay.classList.add('open');
+  const a = grid.children[i];
+  if (a) a.scrollIntoView({{ block: 'center' }});
+}}
+
+function closeIndex() {{ indexOverlay.classList.remove('open'); }}
+
+function jumpTo(n) {{
+  closeIndex();
+  const start = document.getElementById('start');
+  if (start) start.remove();   // first interaction also dismisses the splash
+  show(n);
+}}
+
+document.getElementById('index').onclick = openIndex;
+document.getElementById('index-close').onclick = closeIndex;
+document.getElementById('browse').onclick = openIndex;
+indexOverlay.addEventListener('click', e => {{ if (e.target === indexOverlay) closeIndex(); }});
+document.addEventListener('keydown', e => {{
+  if (e.key === 'i' || e.key === 'I') openIndex();
+  else if (e.key === 'Escape') closeIndex();
+}});
 </script>
 </body></html>
 """
@@ -241,6 +327,8 @@ document.getElementById('go').onclick = () => {{
 def build(max_distance: int, img_max: int) -> None:
     IMG_DIR.mkdir(parents=True, exist_ok=True)
     photos = photo_src.list_photos()
+    if not photos:
+        raise SystemExit("no source photos found; refusing to overwrite slideshow.html")
 
     slides, kept_hashes = [], []
     dropped = no_cap = no_thumb = 0
@@ -281,6 +369,7 @@ def build(max_distance: int, img_max: int) -> None:
             "group": s["group"],
             "caption": s["caption"],
             "img": f"slideshow_img/{dst.name}",
+            "thumb": f"thumbs/{s['stem']}.jpg",
             "audio": f"audio/{wav.name}" if wav.exists() else None,
         })
         if n % 25 == 0:

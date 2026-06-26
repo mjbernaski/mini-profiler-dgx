@@ -14,9 +14,7 @@ PICTURES = Path("/home/mjbernaski/Pictures")
 
 # (folder, human label for the gallery section divider), in display order.
 PHOTO_SOURCES = [
-    ("Shared Greece",   "Attica · the Peloponnese · Rhodes"),
-    ("Shared Greece 2", "More from Greece · Set 2"),
-    ("Shared Greece 3", "More from Greece · Set 3"),
+    ("For Slide Show", "Athens, the Peloponnese & Rhodes"),
 ]
 
 
