@@ -99,8 +99,9 @@ PAGE = """<!doctype html>
                  text-transform: uppercase; color: #8b93a3; }}
   #side .num {{ padding: 6px 30px 0; font-size: 12px; letter-spacing: .12em;
                text-transform: uppercase; color: #6b717c; }}
-  #caption {{ flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 18px 30px 24px;
-             font-size: 19px; line-height: 1.7; color: #d6d9df; }}
+  #caption {{ flex: 1 1 auto; min-height: 0; overflow: hidden; padding: 18px 30px 24px;
+             line-height: 1.45; color: #d6d9df; display: flex; flex-direction: column;
+             justify-content: center; }}
   #controls {{ flex: 0 0 auto; display: flex; align-items: center; gap: 14px;
               padding: 16px 30px 22px; border-top: 1px solid #23252c; }}
   #controls button {{ appearance: none; border: 1px solid #2f3340; background: #1b1e26;
@@ -210,10 +211,28 @@ function render() {{
   group.textContent = s.group;
   num.textContent = (i + 1) + ' / ' + SLIDES.length;
   cap.textContent = s.caption;
-  cap.scrollTop = 0;
+  fitCaption();
   bar.style.width = ((i + 1) / SLIDES.length * 100) + '%';
   if (gridBuilt) markActive();
 }}
+
+// Grow the caption to the largest font size that fills the side panel without
+// overflowing (no scrolling). Binary-searches the font-size; line-height is
+// relative so it scales along. Re-run on resize.
+function fitCaption() {{
+  let lo = 12, hi = 160;
+  for (let k = 0; k < 14; k++) {{
+    const mid = (lo + hi) / 2;
+    cap.style.fontSize = mid + 'px';
+    if (cap.scrollHeight <= cap.clientHeight) lo = mid; else hi = mid;
+  }}
+  cap.style.fontSize = Math.floor(lo) + 'px';
+}}
+let fitRAF = null;
+window.addEventListener('resize', () => {{
+  if (fitRAF) cancelAnimationFrame(fitRAF);
+  fitRAF = requestAnimationFrame(fitCaption);
+}});
 
 function play() {{
   const s = SLIDES[i];
@@ -230,13 +249,6 @@ function play() {{
 
 function show(n) {{ i = (n + SLIDES.length) % SLIDES.length; render(); play(); }}
 function advance(d) {{ clearTimer(); audio.pause(); setTimeout(() => show(i + d), GAP_MS); }}
-
-// Auto-scroll a long caption in time with the narration so it all gets read.
-audio.addEventListener('timeupdate', () => {{
-  const over = cap.scrollHeight - cap.clientHeight;
-  if (over <= 0 || !audio.duration) return;
-  cap.scrollTop = (audio.currentTime / audio.duration) * over;
-}});
 
 audio.addEventListener('ended', () => schedule(GAP_MS));
 
