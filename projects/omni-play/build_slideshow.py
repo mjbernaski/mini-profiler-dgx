@@ -109,6 +109,7 @@ PAGE = """<!doctype html>
               border-radius: 9px; font-size: 16px; cursor: pointer;
               transition: background .15s, border-color .15s; }}
   #controls button:hover {{ background: #262a35; border-color: #3a4150; }}
+  #controls button.on {{ background: #2d6cdf; border-color: #2d6cdf; color: #fff; }}
   #bar {{ position: fixed; left: 0; bottom: 0; height: 3px; background: #2d6cdf;
          width: 0; transition: width .2s linear; z-index: 5; }}
   /* start overlay */
@@ -161,6 +162,7 @@ PAGE = """<!doctype html>
       <button id="prev" title="Previous (←)">⏮</button>
       <button id="toggle" title="Play / pause (space)">⏸</button>
       <button id="next" title="Next (→)">⏭</button>
+      <button id="shuffle" title="Shuffle — play in random order (s)">🔀</button>
       <button id="index" title="Index — jump to a photo (i)">☰</button>
       <button id="mute" title="Mute narration">🔊</button>
     </div>
@@ -193,8 +195,14 @@ const cap   = document.getElementById('caption');
 const bar   = document.getElementById('bar');
 const toggle= document.getElementById('toggle');
 const mute  = document.getElementById('mute');
+const shuffleBtn = document.getElementById('shuffle');
 const audio = new Audio();
-let i = 0, paused = false, timer = null;
+// `order` is the play sequence (a permutation of slide indices); `pos` is where
+// we are within it. In normal mode order is the identity [0,1,2,…]; shuffle mode
+// replaces it with a random permutation so prev/next/progress all follow suit.
+let order = SLIDES.map((_, n) => n);
+let pos = 0, paused = false, timer = null, shuffled = false;
+const cur = () => order[pos];   // current slide index into SLIDES
 
 function clearTimer() {{ if (timer) {{ clearTimeout(timer); timer = null; }} }}
 
@@ -205,14 +213,14 @@ function schedule(ms) {{
 }}
 
 function render() {{
-  const s = SLIDES[i];
+  const s = SLIDES[cur()];
   photo.src = s.img;
   photo.alt = s.stem;
   group.textContent = s.group;
-  num.textContent = (i + 1) + ' / ' + SLIDES.length;
+  num.textContent = (pos + 1) + ' / ' + SLIDES.length;
   cap.textContent = s.caption;
   fitCaption();
-  bar.style.width = ((i + 1) / SLIDES.length * 100) + '%';
+  bar.style.width = ((pos + 1) / SLIDES.length * 100) + '%';
   if (gridBuilt) markActive();
 }}
 
@@ -235,7 +243,7 @@ window.addEventListener('resize', () => {{
 }});
 
 function play() {{
-  const s = SLIDES[i];
+  const s = SLIDES[cur()];
   audio.pause();
   clearTimer();
   if (s.audio && !paused) {{
@@ -247,8 +255,9 @@ function play() {{
   }}
 }}
 
-function show(n) {{ i = (n + SLIDES.length) % SLIDES.length; render(); play(); }}
-function advance(d) {{ clearTimer(); audio.pause(); setTimeout(() => show(i + d), GAP_MS); }}
+function goto(p) {{ pos = (p + SLIDES.length) % SLIDES.length; render(); play(); }}
+function show(n) {{ goto(order.indexOf(n)); }}   // n is a slide index
+function advance(d) {{ clearTimer(); audio.pause(); setTimeout(() => goto(pos + d), GAP_MS); }}
 
 audio.addEventListener('ended', () => schedule(GAP_MS));
 
@@ -262,6 +271,28 @@ function setPaused(p) {{
 document.getElementById('prev').onclick = () => advance(-1);
 document.getElementById('next').onclick = () => advance(1);
 toggle.onclick = () => setPaused(!paused);
+
+// Shuffle: rebuild `order` as a random permutation (or restore identity),
+// keeping the current photo on screen so narration isn't interrupted.
+function setShuffle(on) {{
+  const current = cur();
+  shuffled = on;
+  shuffleBtn.classList.toggle('on', on);
+  if (on) {{
+    for (let k = order.length - 1; k > 0; k--) {{   // Fisher–Yates
+      const j = Math.floor(Math.random() * (k + 1));
+      [order[k], order[j]] = [order[j], order[k]];
+    }}
+    const at = order.indexOf(current);              // move current to the front
+    [order[0], order[at]] = [order[at], order[0]];
+    pos = 0;
+  }} else {{
+    order = SLIDES.map((_, n) => n);
+    pos = current;                                  // resume in sequence
+  }}
+  render();   // current slide is unchanged, so leave audio playing
+}}
+shuffleBtn.onclick = () => setShuffle(!shuffled);
 mute.onclick = () => {{
   const m = mute.dataset.muted === '1' ? '0' : '1';
   mute.dataset.muted = m;
@@ -272,6 +303,7 @@ document.addEventListener('keydown', e => {{
   if (e.key === 'ArrowRight') advance(1);
   else if (e.key === 'ArrowLeft') advance(-1);
   else if (e.key === ' ') {{ e.preventDefault(); setPaused(!paused); }}
+  else if (e.key === 's' || e.key === 'S') setShuffle(!shuffled);
 }});
 
 document.getElementById('go').onclick = () => {{
@@ -302,15 +334,16 @@ function buildGrid() {{
 }}
 
 function markActive() {{
+  const active = cur();
   for (let n = 0; n < grid.children.length; n++)
-    grid.children[n].classList.toggle('active', n === i);
+    grid.children[n].classList.toggle('active', n === active);
 }}
 
 function openIndex() {{
   buildGrid();
   markActive();
   indexOverlay.classList.add('open');
-  const a = grid.children[i];
+  const a = grid.children[cur()];
   if (a) a.scrollIntoView({{ block: 'center' }});
 }}
 
